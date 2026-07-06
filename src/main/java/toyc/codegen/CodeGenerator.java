@@ -23,6 +23,7 @@ public class CodeGenerator {
 
     // Current function context
     private FuncDef currentFunc;
+    private boolean currentFuncIsLeaf;
     private final Map<String, Integer> localOffset = new HashMap<>(); // variable → offset from fp
     private int nextLocalOffset; // grows downward (negative)
 
@@ -97,35 +98,43 @@ public class CodeGenerator {
         // Count locals declared in the body
         countLocals(fd.body());
 
-        // Pre-allocate slots for parameters so they are included in the
-        // frame layout BEFORE we compute frameSize and spill offsets.
-        // This ensures spill slots start BELOW all parameters and locals,
-        // never overlapping with saved ra/s0 at s0-4 and s0-8.
+        // Determine whether this is a leaf function (no calls in body)
+        // and whether parameters can be kept in a0-a7 registers.
+        boolean isLeaf = !stmtContainsCall(fd.body());
+        currentFuncIsLeaf = isLeaf;
+
         Symbol funcSym = analyzer.getFuncSymbols().get(fd);
-        if (funcSym != null && funcSym.getFuncParamNames() != null) {
+        boolean leafParamsKeptInRegs = false;
+        if (isLeaf && funcSym != null && funcSym.getFuncParamNames() != null) {
+            leafParamsKeptInRegs = true;
+            for (String pn : funcSym.getFuncParamNames()) {
+                if (stmtAssignsTo(fd.body(), pn)) {
+                    leafParamsKeptInRegs = false;
+                    break;
+                }
+            }
+        }
+
+        // Pre-allocate slots for parameters only if they'll be stored to stack.
+        if (!leafParamsKeptInRegs && funcSym != null
+                && funcSym.getFuncParamNames() != null) {
             for (String paramName : funcSym.getFuncParamNames()) {
                 getLocalOffset(paramName);
             }
         }
 
         // Reserve spill slots for expression evaluation.
-        // Spill slots start after all locals+params, growing downward.
         int maxSpillDepth = calcMaxSpillDepth(fd.body());
-        // nextLocalOffset points to the last allocated local/param slot.
-        // Spills must start one slot below that to avoid overwriting data.
-        nextSpillOffset = nextLocalOffset - 4;
+        nextSpillOffset = nextLocalOffset - 4; // one slot below last local/param
         int spillAreaSize = maxSpillDepth * 4;
 
-        // Calculate frame size
-        // Layout (high to low, fp = s0 = old sp):
-        //   fp - 4:   saved ra
-        //   fp - 8:   saved old fp
-        //   fp - 12:  param 0 / local 0
-        //   ...
-        //   (spill area below all locals/params)
+        boolean hasLocalsOrParams = !localOffset.isEmpty();
+        boolean needsFrame = hasLocalsOrParams || maxSpillDepth > 0;
 
-        int savedRegsSize = 8; // ra + fp = 2 words = 8 bytes
-        int localSize = -nextLocalOffset - savedRegsSize;
+        // Calculate frame size.
+        int savedRegsSize = (needsFrame || !isLeaf) ? 8 : 0;
+
+        int localSize = -nextLocalOffset - 8;
         if (localSize < 0) localSize = 0;
         frameSize = savedRegsSize + localSize + spillAreaSize;
         frameSize = (frameSize + 15) & ~15; // 16-byte aligned
@@ -135,13 +144,18 @@ public class CodeGenerator {
         emitLabel(fd.name());
 
         // Prologue
-        emit("addi", "sp", "sp", String.valueOf(-frameSize));
-        emit("sw", "ra", (frameSize - 4) + "(sp)");   // save ra
-        emit("sw", "s0", (frameSize - 8) + "(sp)");   // save fp
-        emit("addi", "s0", "sp", String.valueOf(frameSize)); // fp = old sp
+        if (frameSize > 0) {
+            emit("addi", "sp", "sp", String.valueOf(-frameSize));
+            if (!isLeaf) {
+                emit("sw", "ra", (frameSize - 4) + "(sp)");
+            }
+            emit("sw", "s0", (frameSize - 8) + "(sp)");
+            emit("addi", "s0", "sp", String.valueOf(frameSize));
+        }
 
-        // Store parameters into local slots (offsets already allocated above)
-        if (funcSym != null && funcSym.getFuncParamNames() != null) {
+        // Store parameters into local slots.
+        if (!leafParamsKeptInRegs && funcSym != null
+                && funcSym.getFuncParamNames() != null && frameSize > 0) {
             int argReg = 0;
             for (String paramName : funcSym.getFuncParamNames()) {
                 if (argReg < 8) {
@@ -158,9 +172,13 @@ public class CodeGenerator {
 
         // Epilogue
         emitLabel(funcEpilogueLabel());
-        emit("lw", "ra", (frameSize - 4) + "(sp)");
-        emit("lw", "s0", (frameSize - 8) + "(sp)");
-        emit("addi", "sp", "sp", String.valueOf(frameSize));
+        if (frameSize > 0) {
+            if (!isLeaf) {
+                emit("lw", "ra", (frameSize - 4) + "(sp)");
+            }
+            emit("lw", "s0", (frameSize - 8) + "(sp)");
+            emit("addi", "sp", "sp", String.valueOf(frameSize));
+        }
         emit("ret");
 
         currentFunc = null;
@@ -236,15 +254,16 @@ public class CodeGenerator {
                     yield Math.max(calcMaxExprDepth(be.left()),
                                    calcMaxExprDepth(be.right()));
                 }
-                // Regular binary: 1 spill slot for this level + max of children
+                // Regular binary: a spill is only needed if the right operand
+                // (or the left operand evaluation) contains a function call.
+                if (!exprContainsCall(be.right())) {
+                    // No call in right operand → genBinary skips the spill.
+                    yield Math.max(calcMaxExprDepth(be.left()),
+                                   calcMaxExprDepth(be.right()));
+                }
+                // Right contains a call → a spill IS needed at this level.
                 int leftDepth = calcMaxExprDepth(be.left());
                 int rightDepth = calcMaxExprDepth(be.right());
-                // Left is evaluated, spilled, then right is evaluated.
-                // Max = 1 (this spill) + max(left depth while evaluating left,
-                //   right depth while evaluating right)
-                // But more precisely: during left eval, we don't have this spill yet.
-                // During right eval, we have 1 spill (from this level).
-                // So max depth = max(leftDepth, 1 + rightDepth)
                 yield Math.max(leftDepth, 1 + rightDepth);
             }
             case UnaryExpr ue -> calcMaxExprDepth(ue.operand());
@@ -425,6 +444,21 @@ public class CodeGenerator {
             // Load from global address: la r, sym; lw r, 0(r)
             emit("la", r, sym.getName());
             emit("lw", r, "0(" + r + ")");
+        } else if (currentFuncIsLeaf && sym.getKind() == Symbol.Kind.PARAM
+                && !localOffset.containsKey(id.name())) {
+            // Leaf function: parameter kept in its original a-register
+            // (not assigned to, not stored to stack).
+            // Find which parameter index this is.
+            Symbol funcSym = analyzer.getFuncSymbols().get(currentFunc);
+            int paramIdx = -1;
+            if (funcSym != null && funcSym.getFuncParamNames() != null) {
+                paramIdx = funcSym.getFuncParamNames().indexOf(id.name());
+            }
+            if (paramIdx >= 0 && paramIdx < 8) {
+                emit("mv", r, "a" + paramIdx);
+            } else {
+                emit("li", r, "0"); // fallback (should not happen)
+            }
         } else {
             int offset = getLocalOffset(id.name());
             emit("lw", r, offset + "(s0)");
@@ -441,26 +475,33 @@ public class CodeGenerator {
             return genLogicalOr(be);
         }
 
-        // Evaluate left and keep in register.
-        // Evaluate right into a different register.
-        // Compute result = left OP right.
-        // Note: if right evaluation involves function calls, t0-t6 are caller-saved
-        // and leftReg will be clobbered. We handle this by spilling left to a
-        // frame-relative slot (s0-relative) before evaluating right, which
-        // keeps sp 16-byte aligned and avoids stack corruption.
         String leftReg = genExpr(be.left());
-        int spillOffset = allocateSpillSlot();
-        spillReg(leftReg, spillOffset);
-        freeReg(leftReg);
 
-        String rightReg = genExpr(be.right());
-        String savedLeft = loadSpill(spillOffset);
-        freeSpillSlot(spillOffset); // recycle for reuse
+        // Only spill left if the right operand contains a function call
+        // (which may clobber caller-saved temp registers t0-t6).
+        // For simple right operands (ids, literals, arithmetic), we can
+        // keep left in a register and avoid costly memory traffic.
+        String rightReg;
+        String resultReg;
 
-        String resultReg = allocReg();
-        emit("mv", resultReg, savedLeft);
-        freeReg(savedLeft);
+        if (exprContainsCall(be.right())) {
+            // Right operand contains a call — spill left to frame.
+            int spillOffset = allocateSpillSlot();
+            spillReg(leftReg, spillOffset);
+            freeReg(leftReg);
 
+            rightReg = genExpr(be.right());
+            resultReg = loadSpill(spillOffset); // load spilled left as result
+            freeSpillSlot(spillOffset);
+        } else {
+            // Right operand has no calls — keep left in register.
+            rightReg = genExpr(be.right());
+            resultReg = allocReg();
+            emit("mv", resultReg, leftReg);
+            freeReg(leftReg);
+        }
+
+        // resultReg holds left value; apply operator with rightReg
         switch (be.op()) {
             case "+" -> emit("add", resultReg, resultReg, rightReg);
             case "-" -> emit("sub", resultReg, resultReg, rightReg);
@@ -489,6 +530,60 @@ public class CodeGenerator {
         }
         freeReg(rightReg);
         return resultReg;
+    }
+
+    /**
+     * Check whether an expression contains any function call.
+     */
+    private boolean exprContainsCall(Expr expr) {
+        return switch (expr) {
+            case CallExpr ce -> true;
+            case BinaryExpr be -> exprContainsCall(be.left()) || exprContainsCall(be.right());
+            case UnaryExpr ue -> exprContainsCall(ue.operand());
+            default -> false;
+        };
+    }
+
+    /**
+     * Check whether a statement assigns to a given variable name.
+     */
+    private boolean stmtAssignsTo(Stmt stmt, String name) {
+        return switch (stmt) {
+            case Block b -> {
+                for (Stmt s : b.stmts())
+                    if (stmtAssignsTo(s, name)) yield true;
+                yield false;
+            }
+            case AssignStmt as_ -> as_.name().equals(name);
+            case IfStmt is -> stmtAssignsTo(is.thenStmt(), name)
+                    || (is.elseStmt() != null && stmtAssignsTo(is.elseStmt(), name));
+            case WhileStmt ws -> stmtAssignsTo(ws.body(), name);
+            default -> false;
+        };
+    }
+
+    /**
+     * Check whether a statement contains any function call.
+     */
+    private boolean stmtContainsCall(Stmt stmt) {
+        return switch (stmt) {
+            case Block b -> {
+                for (Stmt s : b.stmts())
+                    if (stmtContainsCall(s)) yield true;
+                yield false;
+            }
+            case ExprStmt es -> exprContainsCall(es.expr());
+            case AssignStmt as_ -> exprContainsCall(as_.value());
+            case VarDecl vd -> exprContainsCall(vd.initExpr());
+            case ConstDecl cd -> exprContainsCall(cd.initExpr());
+            case IfStmt is -> exprContainsCall(is.condition())
+                    || stmtContainsCall(is.thenStmt())
+                    || (is.elseStmt() != null && stmtContainsCall(is.elseStmt()));
+            case WhileStmt ws -> exprContainsCall(ws.condition())
+                    || stmtContainsCall(ws.body());
+            case ReturnStmt rs -> rs.value() != null && exprContainsCall(rs.value());
+            default -> false;
+        };
     }
 
     private String genLogicalAnd(BinaryExpr be) {

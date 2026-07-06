@@ -94,38 +94,41 @@ public class CodeGenerator {
         freeSpillSlots.clear();
         nextLocalOffset = -8; // skip past saved ra (-4) and saved fp (-8)
 
-        // Allocate stack slots for parameters and locals
-        // Parameters are passed in a0-a7, but we store them on stack for consistency
-
-        // Count locals by walking the body
+        // Count locals declared in the body
         countLocals(fd.body());
 
+        // Pre-allocate slots for parameters so they are included in the
+        // frame layout BEFORE we compute frameSize and spill offsets.
+        // This ensures spill slots start BELOW all parameters and locals,
+        // never overlapping with saved ra/s0 at s0-4 and s0-8.
+        Symbol funcSym = analyzer.getFuncSymbols().get(fd);
+        if (funcSym != null && funcSym.getFuncParamNames() != null) {
+            for (String paramName : funcSym.getFuncParamNames()) {
+                getLocalOffset(paramName);
+            }
+        }
+
         // Reserve spill slots for expression evaluation.
-        // Max spill depth = max nesting depth of binary expressions.
-        // We scan the body to find the maximum spill depth needed.
+        // Spill slots start after all locals+params, growing downward.
         int maxSpillDepth = calcMaxSpillDepth(fd.body());
-        nextSpillOffset = nextLocalOffset; // spill slots grow downward from local area
-        // Pre-allocate spill slots (each is 4 bytes)
+        // nextLocalOffset points to the last allocated local/param slot.
+        // Spills must start one slot below that to avoid overwriting data.
+        nextSpillOffset = nextLocalOffset - 4;
         int spillAreaSize = maxSpillDepth * 4;
 
         // Calculate frame size
         // Layout (high to low, fp = s0 = old sp):
-        //   fp - 4:  saved ra
-        //   fp - 8:  saved old fp
-        //   fp - 12: local 0 / param 0
+        //   fp - 4:   saved ra
+        //   fp - 8:   saved old fp
+        //   fp - 12:  param 0 / local 0
         //   ...
-        //   (then spill area below locals)
+        //   (spill area below all locals/params)
 
         int savedRegsSize = 8; // ra + fp = 2 words = 8 bytes
-        int localSize = -nextLocalOffset - savedRegsSize; // actual local bytes
+        int localSize = -nextLocalOffset - savedRegsSize;
         if (localSize < 0) localSize = 0;
         frameSize = savedRegsSize + localSize + spillAreaSize;
-        // Align to 16 bytes
-        frameSize = (frameSize + 15) & ~15;
-
-        // Adjust nextSpillOffset to be relative to s0, starting after locals
-        // Spill slots start at nextLocalOffset and go downward
-        nextSpillOffset = nextLocalOffset;
+        frameSize = (frameSize + 15) & ~15; // 16-byte aligned
 
         // Emit function label
         emit("");
@@ -137,8 +140,7 @@ public class CodeGenerator {
         emit("sw", "s0", (frameSize - 8) + "(sp)");   // save fp
         emit("addi", "s0", "sp", String.valueOf(frameSize)); // fp = old sp
 
-        // Store parameters into local slots
-        Symbol funcSym = analyzer.getFuncSymbols().get(fd);
+        // Store parameters into local slots (offsets already allocated above)
         if (funcSym != null && funcSym.getFuncParamNames() != null) {
             int argReg = 0;
             for (String paramName : funcSym.getFuncParamNames()) {
@@ -154,7 +156,7 @@ public class CodeGenerator {
         // Generate body
         genStmt(fd.body());
 
-        // Epilogue (common exit point for all returns)
+        // Epilogue
         emitLabel(funcEpilogueLabel());
         emit("lw", "ra", (frameSize - 4) + "(sp)");
         emit("lw", "s0", (frameSize - 8) + "(sp)");

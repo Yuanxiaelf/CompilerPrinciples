@@ -91,6 +91,7 @@ public class CodeGenerator {
     private void genFuncDef(FuncDef fd) {
         currentFunc = fd;
         localOffset.clear();
+        freeSpillSlots.clear();
         nextLocalOffset = -8; // skip past saved ra (-4) and saved fp (-8)
 
         // Allocate stack slots for parameters and locals
@@ -99,20 +100,32 @@ public class CodeGenerator {
         // Count locals by walking the body
         countLocals(fd.body());
 
+        // Reserve spill slots for expression evaluation.
+        // Max spill depth = max nesting depth of binary expressions.
+        // We scan the body to find the maximum spill depth needed.
+        int maxSpillDepth = calcMaxSpillDepth(fd.body());
+        nextSpillOffset = nextLocalOffset; // spill slots grow downward from local area
+        // Pre-allocate spill slots (each is 4 bytes)
+        int spillAreaSize = maxSpillDepth * 4;
+
         // Calculate frame size
         // Layout (high to low, fp = s0 = old sp):
         //   fp - 4:  saved ra
         //   fp - 8:  saved old fp
-        //   fp - 12: local 0
-        //   fp - 16: local 1
+        //   fp - 12: local 0 / param 0
         //   ...
+        //   (then spill area below locals)
 
         int savedRegsSize = 8; // ra + fp = 2 words = 8 bytes
         int localSize = -nextLocalOffset - savedRegsSize; // actual local bytes
         if (localSize < 0) localSize = 0;
-        frameSize = savedRegsSize + localSize;
+        frameSize = savedRegsSize + localSize + spillAreaSize;
         // Align to 16 bytes
         frameSize = (frameSize + 15) & ~15;
+
+        // Adjust nextSpillOffset to be relative to s0, starting after locals
+        // Spill slots start at nextLocalOffset and go downward
+        nextSpillOffset = nextLocalOffset;
 
         // Emit function label
         emit("");
@@ -171,7 +184,77 @@ public class CodeGenerator {
             case WhileStmt ws -> countLocals(ws.body());
             default -> {}
         }
-        // Also check nested blocks inside
+    }
+
+    /**
+     * Count the maximum number of simultaneously-live spill slots needed
+     * for binary expression evaluation. This equals the maximum depth
+     * of binary expression nesting within any statement.
+     */
+    private int calcMaxSpillDepth(Stmt stmt) {
+        return switch (stmt) {
+            case Block b -> {
+                int maxD = 0;
+                for (Stmt s : b.stmts()) {
+                    maxD = Math.max(maxD, calcMaxSpillDepth(s));
+                }
+                yield maxD;
+            }
+            case IfStmt is -> {
+                int d = calcMaxExprDepth(is.condition());
+                d = Math.max(d, calcMaxSpillDepth(is.thenStmt()));
+                if (is.elseStmt() != null) d = Math.max(d, calcMaxSpillDepth(is.elseStmt()));
+                yield d;
+            }
+            case WhileStmt ws -> {
+                int d = calcMaxExprDepth(ws.condition());
+                d = Math.max(d, calcMaxSpillDepth(ws.body()));
+                yield d;
+            }
+            case ExprStmt es -> calcMaxExprDepth(es.expr());
+            case AssignStmt as_ -> calcMaxExprDepth(as_.value());
+            case VarDecl vd -> calcMaxExprDepth(vd.initExpr());
+            case ConstDecl cd -> calcMaxExprDepth(cd.initExpr());
+            case ReturnStmt rs -> rs.value() != null ? calcMaxExprDepth(rs.value()) : 0;
+            default -> 0;
+        };
+    }
+
+    /**
+     * Calculate the max binary-expr nesting depth in an expression.
+     * Each binary expression needs one spill slot during evaluation;
+     * nested binary expressions need one spill slot per level.
+     * Short-circuit operators (&&, ||) don't use spill slots.
+     */
+    private int calcMaxExprDepth(Expr expr) {
+        return switch (expr) {
+            case BinaryExpr be -> {
+                if ("&&".equals(be.op()) || "||".equals(be.op())) {
+                    // Short-circuit ops don't use spill slots
+                    yield Math.max(calcMaxExprDepth(be.left()),
+                                   calcMaxExprDepth(be.right()));
+                }
+                // Regular binary: 1 spill slot for this level + max of children
+                int leftDepth = calcMaxExprDepth(be.left());
+                int rightDepth = calcMaxExprDepth(be.right());
+                // Left is evaluated, spilled, then right is evaluated.
+                // Max = 1 (this spill) + max(left depth while evaluating left,
+                //   right depth while evaluating right)
+                // But more precisely: during left eval, we don't have this spill yet.
+                // During right eval, we have 1 spill (from this level).
+                // So max depth = max(leftDepth, 1 + rightDepth)
+                yield Math.max(leftDepth, 1 + rightDepth);
+            }
+            case UnaryExpr ue -> calcMaxExprDepth(ue.operand());
+            case CallExpr ce -> {
+                int maxD = 0;
+                for (Expr arg : ce.args()) {
+                    maxD = Math.max(maxD, calcMaxExprDepth(arg));
+                }
+                yield maxD;
+            }
+            default -> 0;
+        };
     }
 
     private int allocateLocal(String name) {
@@ -356,15 +439,22 @@ public class CodeGenerator {
             return genLogicalOr(be);
         }
 
-        // Regular binary: eval left, save, eval right, combine
+        // Evaluate left and keep in register.
+        // Evaluate right into a different register.
+        // Compute result = left OP right.
+        // Note: if right evaluation involves function calls, t0-t6 are caller-saved
+        // and leftReg will be clobbered. We handle this by spilling left to a
+        // frame-relative slot (s0-relative) before evaluating right, which
+        // keeps sp 16-byte aligned and avoids stack corruption.
         String leftReg = genExpr(be.left());
-        pushReg(leftReg);
-        freeReg(leftReg); // free after saving to stack
-        String rightReg = genExpr(be.right());
-        String savedLeft = popReg();
+        int spillOffset = allocateSpillSlot();
+        spillReg(leftReg, spillOffset);
+        freeReg(leftReg);
 
-        // Now savedLeft has left value, rightReg has right value
-        // Copy savedLeft to a temp for the operation
+        String rightReg = genExpr(be.right());
+        String savedLeft = loadSpill(spillOffset);
+        freeSpillSlot(spillOffset); // recycle for reuse
+
         String resultReg = allocReg();
         emit("mv", resultReg, savedLeft);
         freeReg(savedLeft);
@@ -468,36 +558,86 @@ public class CodeGenerator {
     private String genCall(CallExpr ce) {
         int numArgs = ce.args().size();
 
-        // Evaluate arguments into a0-a7 (and stack for overflow)
-        // Save current temp regs to stack before call
-        // Actually, caller-saved regs will be clobbered, so we need to
-        // save any live temps.
-
-        // Evaluate args and store in parameter registers
+        // Phase 1: Evaluate all register args (0..min(numArgs,8)-1) into
+        // temp registers. We accumulate them first so nested function calls
+        // inside later args cannot clobber a0-a7 already set for earlier args.
+        int regArgCount = Math.min(numArgs, 8);
         List<String> argRegs = new ArrayList<>();
-        for (int i = 0; i < numArgs && i < 8; i++) {
+        List<Integer> argSpillOffsets = new ArrayList<>();
+
+        for (int i = 0; i < regArgCount; i++) {
+            // If we're low on temp registers, spill the oldest accumulated
+            // arg to a frame slot to free up a register.
+            if (!hasFreeReg()) {
+                // Find the first non-null (live) arg to spill
+                int spillIdx = 0;
+                while (spillIdx < argRegs.size() && argRegs.get(spillIdx) == null) {
+                    spillIdx++;
+                }
+                if (spillIdx < argRegs.size()) {
+                    int spillOff = allocateSpillSlot();
+                    spillReg(argRegs.get(spillIdx), spillOff);
+                    freeReg(argRegs.get(spillIdx));
+                    argSpillOffsets.add(spillOff);
+                    argRegs.set(spillIdx, null);
+                }
+            }
             String r = genExpr(ce.args().get(i));
             argRegs.add(r);
+            argSpillOffsets.add(-1); // -1 means "not spilled"
         }
 
-        // Move evaluated args to a0-a7
+        // Phase 2: Move accumulated args to a0-a7, loading spilled ones.
+        // Compress out null entries (spilled args) and track spill offsets.
+        int spillCursor = 0;
         for (int i = 0; i < argRegs.size(); i++) {
-            emit("mv", "a" + i, argRegs.get(i));
-            freeReg(argRegs.get(i));
+            String reg = argRegs.get(i);
+            if (reg == null) {
+                // This arg was spilled; find its offset and load it
+                while (spillCursor < argSpillOffsets.size() &&
+                       argSpillOffsets.get(spillCursor) == -1) {
+                    spillCursor++;
+                }
+                int off = argSpillOffsets.get(spillCursor);
+                reg = loadSpill(off);
+                freeSpillSlot(off); // recycle for reuse
+                argRegs.set(i, reg);
+                spillCursor++;
+            }
         }
 
-        // Handle args beyond 8 (push to stack)
-        for (int i = 8; i < numArgs; i++) {
-            String r = genExpr(ce.args().get(i));
-            // Push to stack (caller's responsibility)
-            // For simplicity, use sp-relative stores
-            int stackSlot = (i - 8) * 4;
-            emit("sw", r, stackSlot + "(sp)");
-            freeReg(r);
+        for (int i = 0; i < argRegs.size(); i++) {
+            String reg = argRegs.get(i);
+            if (reg != null) {
+                emit("mv", "a" + i, reg);
+                freeReg(reg);
+            }
         }
 
-        // Call function
+        // Phase 3: Handle args beyond 8 — allocate outgoing-arg area below sp,
+        // store args, then call.
+        int extraArgs = numArgs - 8;
+        int extraAlignedSize = 0;
+        if (extraArgs > 0) {
+            int extraSize = extraArgs * 4;
+            extraAlignedSize = (extraSize + 15) & ~15;
+            emit("addi", "sp", "sp", String.valueOf(-extraAlignedSize));
+
+            for (int i = 8; i < numArgs; i++) {
+                String r = genExpr(ce.args().get(i));
+                int offset = (i - 8) * 4;
+                emit("sw", r, offset + "(sp)");
+                freeReg(r);
+            }
+        }
+
+        // Phase 4: Call function
         emit("call", ce.funcName());
+
+        // Deallocate extra-args space
+        if (extraAlignedSize > 0) {
+            emit("addi", "sp", "sp", String.valueOf(extraAlignedSize));
+        }
 
         // Result is in a0, move to a temp register
         String resultReg = allocReg();
@@ -517,6 +657,13 @@ public class CodeGenerator {
         throw new RuntimeException("out of temporary registers");
     }
 
+    private boolean hasFreeReg() {
+        for (int i = 0; i < NUM_TEMPS; i++) {
+            if (!tempUsed[i]) return true;
+        }
+        return false;
+    }
+
     private void freeReg(String reg) {
         for (int i = 0; i < NUM_TEMPS; i++) {
             if (TEMP_REGS[i].equals(reg)) {
@@ -526,20 +673,33 @@ public class CodeGenerator {
         }
     }
 
-    // Stack-based save/restore for nested expressions
-    private int pushDepth = 0;
+    // Spill slot for preserving register across right-operand evaluation.
+    // Uses a frame-relative slot (s0-relative) to avoid sp alignment issues
+    // and function call clobbering of temp registers.
+    // Slots are recycled via a free stack so max live spill depth bounds frame usage.
+    private int nextSpillOffset = 0; // will be set during genFuncDef
+    private final Deque<Integer> freeSpillSlots = new ArrayDeque<>();
 
-    private void pushReg(String reg) {
-        emit("addi", "sp", "sp", "-4");
-        emit("sw", reg, "0(sp)");
-        pushDepth++;
+    private int allocateSpillSlot() {
+        if (!freeSpillSlots.isEmpty()) {
+            return freeSpillSlots.pop();
+        }
+        int slot = nextSpillOffset;
+        nextSpillOffset -= 4;
+        return slot;
     }
 
-    private String popReg() {
+    private void freeSpillSlot(int offset) {
+        freeSpillSlots.push(offset);
+    }
+
+    private void spillReg(String reg, int offset) {
+        emit("sw", reg, offset + "(s0)");
+    }
+
+    private String loadSpill(int offset) {
         String reg = allocReg();
-        emit("lw", reg, "0(sp)");
-        emit("addi", "sp", "sp", "4");
-        pushDepth--;
+        emit("lw", reg, offset + "(s0)");
         return reg;
     }
 

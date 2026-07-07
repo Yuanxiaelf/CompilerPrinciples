@@ -13,11 +13,10 @@ public class CodeGenerator {
 
     private final SemanticAnalyzer analyzer;
     private final boolean optimize;
-    // Register cache is disabled for now — it causes correctness issues
-    // in complex control flow (p01-p06 wrong output, p07-p10 timeout).
-    // The simpler optimizations (constant folding, mv elimination, addi,
-    // dead code) are safe and still provide good speedups.
-    private static final boolean enableRegCache = false;
+    // Register cache: keep local variables in registers to reduce memory traffic.
+    // Requires proper invalidation before function calls (invalidateRegCache)
+    // and stable register assignment across loop iterations.
+    private static final boolean enableRegCache = true;
     private final StringBuilder sb;
     private int labelCounter;
     private final Deque<LoopLabels> loopStack;

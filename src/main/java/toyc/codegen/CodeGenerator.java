@@ -156,7 +156,13 @@ public class CodeGenerator {
         int finalLocalOffset = nextLocalOffset;
 
         // Reserve spill slots for expression evaluation.
+        // calcMaxSpillDepth covers binary-expr and per-call spills.
+        // Add headroom for nested-call scenarios where outer genCall
+        // pre-spills coexist with inner genCall arg-eval spills.
         int maxSpillDepth = calcMaxSpillDepth(fd.body());
+        if (!isLeaf) {
+            maxSpillDepth += 4; // safety margin for nested-call overlaps
+        }
         int spillAreaSize = maxSpillDepth * 4;
 
         boolean hasLocalsOrParams = finalLocalOffset < -8;
@@ -323,7 +329,11 @@ public class CodeGenerator {
                 for (Expr arg : ce.args()) {
                     maxD = Math.max(maxD, calcMaxExprDepth(arg));
                 }
-                yield maxD;
+                // genCall may spill previously-evaluated register args
+                // before evaluating call-containing args. Conservative
+                // upper bound: all register args spilled at once.
+                int callSpills = Math.min(ce.args().size(), 8);
+                yield Math.max(maxD, callSpills);
             }
             default -> 0;
         };
@@ -977,82 +987,100 @@ public class CodeGenerator {
         }
 
         int numArgs = ce.args().size();
-
-        // Phase 1: Evaluate all register args (0..min(numArgs,8)-1) into
-        // temp registers. We accumulate them first so nested function calls
-        // inside later args cannot clobber a0-a7 already set for earlier args.
         int regArgCount = Math.min(numArgs, 8);
-        List<String> argRegs = new ArrayList<>();
-        List<Integer> argSpillOffsets = new ArrayList<>();
+        int extraArgs = numArgs - 8;
 
-        for (int i = 0; i < regArgCount; i++) {
-            // If we're low on temp registers, spill the oldest accumulated
-            // arg to a frame slot to free up a register.
-            if (!hasFreeReg()) {
-                // Find the first non-null (live) arg to spill
-                int spillIdx = 0;
-                while (spillIdx < argRegs.size() && argRegs.get(spillIdx) == null) {
-                    spillIdx++;
-                }
-                if (spillIdx < argRegs.size()) {
-                    int spillOff = allocateSpillSlot();
-                    spillReg(argRegs.get(spillIdx), spillOff);
-                    freeReg(argRegs.get(spillIdx));
-                    argSpillOffsets.add(spillOff);
-                    argRegs.set(spillIdx, null);
-                }
-            }
-            String r = genExpr(ce.args().get(i));
-            argRegs.add(r);
-            argSpillOffsets.add(-1); // -1 means "not spilled"
+        // Precompute which args contain function calls, so we can spill
+        // live arg registers before a nested call clobbers t0-t6.
+        boolean[] argHasCall = new boolean[numArgs];
+        for (int i = 0; i < numArgs; i++) {
+            argHasCall[i] = exprContainsCall(ce.args().get(i));
         }
 
-        // Phase 2a: Load all spilled args back from spill slots.
-        // Track which args we move to a-regs early (to free up temp regs).
-        int spillCursor = 0;
-        Set<Integer> alreadyMoved = new HashSet<>();
-        for (int i = 0; i < argRegs.size(); i++) {
-            if (argRegs.get(i) == null) {
-                // If no free register, move a later held arg to its a-reg
-                // early to free up a temp register for loading the spill.
-                if (!hasFreeReg()) {
-                    for (int j = i + 1; j < argRegs.size(); j++) {
-                        String rj = argRegs.get(j);
-                        if (rj != null) {
-                            emit("mv", "a" + j, rj);
-                            freeReg(rj);
-                            alreadyMoved.add(j);
-                            break;
-                        }
+        // Evaluate ALL args (both register and extra) into temp registers
+        // or spill slots. Extra args are evaluated here (before register
+        // args move to a0-a7) so nested calls inside extra args don't
+        // clobber a0-a7.
+        String[] argRegs = new String[numArgs];
+        int[] argSpills = new int[numArgs]; // -1 = not spilled
+
+        for (int i = 0; i < numArgs; i++) {
+            argSpills[i] = -1;
+
+            // If this arg contains a function call, spill all previously
+            // evaluated live arg registers. Nested calls clobber t0-t6
+            // (caller-saved), so any live value in a temp register will
+            // be silently corrupted.
+            if (argHasCall[i]) {
+                for (int j = 0; j < i; j++) {
+                    if (argRegs[j] != null && argSpills[j] == -1) {
+                        argSpills[j] = allocateSpillSlot();
+                        spillReg(argRegs[j], argSpills[j]);
+                        freeReg(argRegs[j]);
+                        argRegs[j] = null;
                     }
                 }
-                // Find spill offset for this spilled arg
-                while (spillCursor < argSpillOffsets.size() &&
-                       argSpillOffsets.get(spillCursor) == -1) {
-                    spillCursor++;
+            }
+
+            // Ensure at least 2 free registers before evaluating each arg.
+            // Binary expressions need 2 registers (left + right operand),
+            // and complex expressions may need more. Spill the oldest live
+            // (non-spilled) arg to free one up.
+            while (countFreeRegs() < 2) {
+                boolean spilled = false;
+                for (int j = 0; j < i; j++) {
+                    if (argRegs[j] != null && argSpills[j] == -1) {
+                        argSpills[j] = allocateSpillSlot();
+                        spillReg(argRegs[j], argSpills[j]);
+                        freeReg(argRegs[j]);
+                        argRegs[j] = null;
+                        spilled = true;
+                        break;
+                    }
                 }
-                int off = argSpillOffsets.get(spillCursor);
-                String reg = loadSpill(off);
-                freeSpillSlot(off);
-                argRegs.set(i, reg);
-                spillCursor++;
+                if (!spilled) break;
+            }
+
+            String r = genExpr(ce.args().get(i));
+            argRegs[i] = r;
+        }
+
+        // Load back spilled register args directly into a-regs.
+        // This avoids register exhaustion when all temp registers are
+        // occupied by other non-spilled evaluated args.
+        for (int i = 0; i < regArgCount; i++) {
+            if (argSpills[i] != -1) {
+                emit("lw", "a" + i, argSpills[i] + "(s0)");
+                freeSpillSlot(argSpills[i]);
+                argSpills[i] = -1;
+                // arg temp reg was freed when spilled; mark as moved
+                if (argRegs[i] != null) {
+                    freeReg(argRegs[i]);
+                }
+                argRegs[i] = null;
             }
         }
 
-        // Phase 2b: Move remaining held args to a-regs
-        for (int i = 0; i < argRegs.size(); i++) {
-            if (!alreadyMoved.contains(i)) {
-                String reg = argRegs.get(i);
-                if (reg != null) {
-                    emit("mv", "a" + i, reg);
-                    freeReg(reg);
-                }
+        // Move non-spilled register args from temp regs to a-regs
+        for (int i = 0; i < regArgCount; i++) {
+            if (argRegs[i] != null) {
+                emit("mv", "a" + i, argRegs[i]);
+                freeReg(argRegs[i]);
+                argRegs[i] = null;
+            }
+        }
+        // At this point all temp registers should be free.
+
+        // Load back spilled extra args (plenty of free regs now)
+        for (int i = 8; i < numArgs; i++) {
+            if (argSpills[i] != -1) {
+                argRegs[i] = loadSpill(argSpills[i]);
+                freeSpillSlot(argSpills[i]);
+                argSpills[i] = -1;
             }
         }
 
-        // Phase 3: Handle args beyond 8 — allocate outgoing-arg area below sp,
-        // store args, then call.
-        int extraArgs = numArgs - 8;
+        // Set up outgoing-arg area on stack for args beyond 8
         int extraAlignedSize = 0;
         if (extraArgs > 0) {
             int extraSize = extraArgs * 4;
@@ -1060,14 +1088,16 @@ public class CodeGenerator {
             emit("addi", "sp", "sp", String.valueOf(-extraAlignedSize));
 
             for (int i = 8; i < numArgs; i++) {
-                String r = genExpr(ce.args().get(i));
-                int offset = (i - 8) * 4;
-                emit("sw", r, offset + "(sp)");
-                freeReg(r);
+                if (argRegs[i] != null) {
+                    int offset = (i - 8) * 4;
+                    emit("sw", argRegs[i], offset + "(sp)");
+                    freeReg(argRegs[i]);
+                    argRegs[i] = null;
+                }
             }
         }
 
-        // Phase 4: Call function
+        // Call the function
         emit("call", ce.funcName());
 
         // Deallocate extra-args space
@@ -1079,6 +1109,15 @@ public class CodeGenerator {
         String resultReg = allocReg();
         emit("mv", resultReg, "a0");
         return resultReg;
+    }
+
+    /** Count the number of free (unused) temp registers. */
+    private int countFreeRegs() {
+        int count = 0;
+        for (int i = 0; i < NUM_TEMPS; i++) {
+            if (!tempUsed[i]) count++;
+        }
+        return count;
     }
 
     // ========== Optimization helpers ==========

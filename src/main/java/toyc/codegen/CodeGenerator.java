@@ -462,9 +462,18 @@ public class CodeGenerator {
                     else if (s instanceof ConstDecl cd) blockVars.add(cd.name());
                     genStmt(s);
                 }
-                // Flush and invalidate block-scoped variables on exit
+                // Flush and invalidate block-scoped variables on exit.
+                // Also clean up any last-store register entries so the
+                // registers don't stay marked as "used" after the block.
                 for (String name : blockVars) {
                     invalidateVar(name);
+                    if (optimize) {
+                        String lsReg = lastStoreReg.remove(name);
+                        if (lsReg != null) {
+                            regValid.remove(lsReg);
+                            freeRegRaw(lsReg);
+                        }
+                    }
                 }
                 localOffsetStack.pop();
             }
@@ -979,8 +988,12 @@ public class CodeGenerator {
 
     private String genCall(CallExpr ce) {
         // Before a call, clear last-store tracking since caller-saved regs
-        // (t0-t6, a0-a7) will be clobbered.
+        // (t0-t6, a0-a7) will be clobbered. Must also free the underlying
+        // temp registers, otherwise they stay marked as "used" forever.
         if (optimize) {
+            for (String reg : lastStoreReg.values()) {
+                freeRegRaw(reg);
+            }
             invalidateRegCache();
             lastStoreReg.clear();
             regValid.clear();
@@ -1186,18 +1199,37 @@ public class CodeGenerator {
                 return TEMP_REGS[i];
             }
         }
-        // All temp registers are in use. If optimizing, evict a cached
-        // (non-dirty) variable to free one. Dirty vars must stay for correctness.
+        // All temp registers are in use. Try to steal one from the
+        // last-store cache (optimization). These registers hold values
+        // already stored to memory, so stealing them is safe — the
+        // next read will just use lw instead.
         if (optimize) {
-            // Copy key set to avoid ConcurrentModificationException
+            for (int i = 0; i < NUM_TEMPS; i++) {
+                String reg = TEMP_REGS[i];
+                if (regValid.contains(reg)) {
+                    // Find which variable this register was cached for
+                    String varName = null;
+                    for (var e : lastStoreReg.entrySet()) {
+                        if (e.getValue().equals(reg)) {
+                            varName = e.getKey();
+                            break;
+                        }
+                    }
+                    if (varName != null) {
+                        lastStoreReg.remove(varName);
+                    }
+                    regValid.remove(reg);
+                    tempUsed[i] = true;
+                    return reg;
+                }
+            }
+            // Try to evict a clean cached variable from the register cache.
             for (String varName : new ArrayList<>(varRegCache.keySet())) {
                 if (!varDirty.contains(varName)) {
-                    // This var is clean (already stored to memory) — safe to evict.
                     String reg = varRegCache.get(varName);
                     if (reg != null) {
                         varRegCache.remove(varName);
                         regToVar.remove(reg);
-                        // Mark this register as allocated for the caller.
                         tempUsed[regIndex(reg)] = true;
                         return reg;
                     }

@@ -13,10 +13,11 @@ public class CodeGenerator {
 
     private final SemanticAnalyzer analyzer;
     private final boolean optimize;
-    // Register cache: keep local variables in registers to reduce memory traffic.
-    // Requires proper invalidation before function calls (invalidateRegCache)
-    // and stable register assignment across loop iterations.
-    private static final boolean enableRegCache = true;
+    // Register cache DISABLED: stable-register approach causes correctness
+    // bugs (wrong output on p01-p05, timeouts on p06-p12). Requires proper
+    // liveness analysis and SSA-based register allocation to work safely.
+    // The simpler optimizations below are safe and still provide good speedups.
+    private static final boolean enableRegCache = false;
     private final StringBuilder sb;
     private int labelCounter;
     private final Deque<LoopLabels> loopStack;
@@ -36,11 +37,17 @@ public class CodeGenerator {
     private int frameSize;
 
     // Register cache for local variables (optimization)
-    // Maps variable name → register holding its current value
+    // Simple "last store" tracking: maps variable name → register from most
+    // recent store. If the register hasn't been reused, the next read can
+    // skip the lw and use the register directly. Much simpler and safer
+    // than full register caching — only tracks one use, no stable registers.
+    private final Map<String, String> lastStoreReg = new HashMap<>();
+    // Registers that still hold their last-stored value (not yet reused).
+    private final Set<String> regValid = new HashSet<>();
+
+    // Full register cache (disabled — too complex, causes correctness bugs)
     private final Map<String, String> varRegCache = new HashMap<>();
-    // Maps register → variable name (reverse mapping)
     private final Map<String, String> regToVar = new HashMap<>();
-    // Tracks whether a cached variable has been stored to its stack slot
     private final Set<String> varDirty = new HashSet<>();
 
     // Loop labels
@@ -111,6 +118,8 @@ public class CodeGenerator {
         varRegCache.clear();
         regToVar.clear();
         varDirty.clear();
+        lastStoreReg.clear();
+        regValid.clear();
         nextLocalOffset = -8; // skip past saved ra (-4) and saved fp (-8)
 
         // Count locals declared in the body
@@ -499,10 +508,13 @@ public class CodeGenerator {
                         emit("sw", r, offset + "(s0)");
                     }
                 }
-                if (!optimize || !enableRegCache) {
+                if (optimize) {
+                    // Last-store optimization: keep register alive for next read
+                    lastStoreReg.put(as_.name(), r);
+                    regValid.add(r);
+                } else {
                     freeReg(r);
                 }
-                // With register cache enabled, register stays cached
             }
             case VarDecl vd -> {
                 // Dead code elimination: only skip if variable is never used
@@ -520,7 +532,10 @@ public class CodeGenerator {
                     varDirty.remove(vd.name()); // stored below
                 }
                 emit("sw", r, offset + "(s0)");
-                if (!optimize || !enableRegCache) {
+                if (optimize) {
+                    lastStoreReg.put(vd.name(), r);
+                    regValid.add(r);
+                } else {
                     freeReg(r);
                 }
             }
@@ -535,12 +550,11 @@ public class CodeGenerator {
                 }
                 String r = genExpr(cd.initExpr());
                 int offset = allocateLocal(cd.name());
-                if (optimize && enableRegCache) {
-                    cacheVar(cd.name(), r);
-                    varDirty.remove(cd.name());
-                }
                 emit("sw", r, offset + "(s0)");
-                if (!optimize || !enableRegCache) {
+                if (optimize) {
+                    lastStoreReg.put(cd.name(), r);
+                    regValid.add(r);
+                } else {
                     freeReg(r);
                 }
             }
@@ -649,15 +663,17 @@ public class CodeGenerator {
             return r;
         }
 
-        // Optimization: check register cache first
+        // Last-store optimization: if variable was just stored and its
+        // register hasn't been reused, use it directly (avoid lw).
         if (optimize) {
-            String cachedReg = getCachedReg(id.name());
-            if (cachedReg != null) {
-                // Copy the cached value to a new register for this use.
-                // The cached register stays owned by the cache.
-                String r = allocReg();
-                emit("mv", r, cachedReg);
-                return r;
+            String lsReg = lastStoreReg.get(id.name());
+            if (lsReg != null && regValid.contains(lsReg)) {
+                // Register still holds the value — use it and consume.
+                regValid.remove(lsReg);
+                lastStoreReg.remove(id.name());
+                // Mark this register as allocated for the caller.
+                tempUsed[regIndex(lsReg)] = true;
+                return lsReg;
             }
         }
 
@@ -952,10 +968,12 @@ public class CodeGenerator {
     }
 
     private String genCall(CallExpr ce) {
-        // Before a call, flush register cache since caller-saved regs (t0-t6, a0-a7)
-        // will be clobbered.
+        // Before a call, clear last-store tracking since caller-saved regs
+        // (t0-t6, a0-a7) will be clobbered.
         if (optimize) {
             invalidateRegCache();
+            lastStoreReg.clear();
+            regValid.clear();
         }
 
         int numArgs = ce.args().size();
@@ -1124,6 +1142,8 @@ public class CodeGenerator {
         for (int i = 0; i < NUM_TEMPS; i++) {
             if (!tempUsed[i]) {
                 tempUsed[i] = true;
+                // This register is being reused — any last-store value is gone
+                regValid.remove(TEMP_REGS[i]);
                 return TEMP_REGS[i];
             }
         }
@@ -1173,8 +1193,9 @@ public class CodeGenerator {
         for (int i = 0; i < NUM_TEMPS; i++) {
             if (TEMP_REGS[i].equals(reg)) {
                 tempUsed[i] = false;
+                // This register is being freed — any last-store value is gone
+                regValid.remove(reg);
                 // If this register was cached for a variable, invalidate
-                // because the register no longer holds the variable's value.
                 if (optimize) {
                     String var = regToVar.remove(reg);
                     if (var != null) {

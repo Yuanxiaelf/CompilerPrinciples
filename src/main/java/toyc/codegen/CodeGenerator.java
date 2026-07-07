@@ -24,7 +24,7 @@ public class CodeGenerator {
     // Current function context
     private FuncDef currentFunc;
     private boolean currentFuncIsLeaf;
-    private final Map<String, Integer> localOffset = new HashMap<>(); // variable → offset from fp
+    private final Deque<Map<String, Integer>> localOffsetStack = new ArrayDeque<>(); // scoped variable → offset from fp
     private int nextLocalOffset; // grows downward (negative)
 
     // Frame info
@@ -91,7 +91,8 @@ public class CodeGenerator {
 
     private void genFuncDef(FuncDef fd) {
         currentFunc = fd;
-        localOffset.clear();
+        localOffsetStack.clear();
+        localOffsetStack.push(new HashMap<>()); // function scope
         freeSpillSlots.clear();
         nextLocalOffset = -8; // skip past saved ra (-4) and saved fp (-8)
 
@@ -123,18 +124,22 @@ public class CodeGenerator {
             }
         }
 
+        // Save the final offset for frame calculation, then reset for code gen.
+        // countLocals and getLocalOffset above advance nextLocalOffset but pop
+        // block scopes, so genStmt must restart from -8 to produce matching offsets.
+        int finalLocalOffset = nextLocalOffset;
+
         // Reserve spill slots for expression evaluation.
         int maxSpillDepth = calcMaxSpillDepth(fd.body());
-        nextSpillOffset = nextLocalOffset - 4; // one slot below last local/param
         int spillAreaSize = maxSpillDepth * 4;
 
-        boolean hasLocalsOrParams = !localOffset.isEmpty();
+        boolean hasLocalsOrParams = finalLocalOffset < -8;
         boolean needsFrame = hasLocalsOrParams || maxSpillDepth > 0;
 
         // Calculate frame size.
         int savedRegsSize = (needsFrame || !isLeaf) ? 8 : 0;
 
-        int localSize = -nextLocalOffset - 8;
+        int localSize = -finalLocalOffset - 8;
         if (localSize < 0) localSize = 0;
         frameSize = savedRegsSize + localSize + spillAreaSize;
         frameSize = (frameSize + 15) & ~15; // 16-byte aligned
@@ -152,6 +157,24 @@ public class CodeGenerator {
             emit("sw", "s0", (frameSize - 8) + "(sp)");
             emit("addi", "s0", "sp", String.valueOf(frameSize));
         }
+
+        // Reset local offset state for code generation.
+        // countLocals already consumed offset space; genStmt must replay
+        // the same allocations starting from -8 so offsets match the frame.
+        nextLocalOffset = -8;
+        localOffsetStack.clear();
+        localOffsetStack.push(new HashMap<>()); // function scope
+
+        // Re-run parameter pre-allocation so genStmt/genId can find them.
+        if (!leafParamsKeptInRegs && funcSym != null
+                && funcSym.getFuncParamNames() != null) {
+            for (String paramName : funcSym.getFuncParamNames()) {
+                getLocalOffset(paramName);
+            }
+        }
+
+        // Set up spill slot area for code generation (below all locals/params).
+        nextSpillOffset = finalLocalOffset - 4;
 
         // Store parameters into local slots.
         if (!leafParamsKeptInRegs && funcSym != null
@@ -193,7 +216,9 @@ public class CodeGenerator {
     private void countLocals(Stmt stmt) {
         switch (stmt) {
             case Block b -> {
+                localOffsetStack.push(new HashMap<>());
                 for (Stmt s : b.stmts()) countLocals(s);
+                localOffsetStack.pop();
             }
             case VarDecl vd -> allocateLocal(vd.name());
             case ConstDecl cd -> allocateLocal(cd.name());
@@ -279,21 +304,37 @@ public class CodeGenerator {
     }
 
     private int allocateLocal(String name) {
-        if (localOffset.containsKey(name)) {
-            return localOffset.get(name);
+        Map<String, Integer> currentScope = localOffsetStack.peek();
+        if (currentScope.containsKey(name)) {
+            return currentScope.get(name);
         }
         nextLocalOffset -= 4;
-        localOffset.put(name, nextLocalOffset);
+        currentScope.put(name, nextLocalOffset);
         return nextLocalOffset;
     }
 
     private int getLocalOffset(String name) {
-        Integer off = localOffset.get(name);
-        if (off != null) return off;
-        // For parameters not yet allocated
+        // Search from innermost scope outward
+        for (Map<String, Integer> scope : localOffsetStack) {
+            Integer off = scope.get(name);
+            if (off != null) return off;
+        }
+        // For parameters not yet allocated — put in function scope (bottom)
         nextLocalOffset -= 4;
-        localOffset.put(name, nextLocalOffset);
+        localOffsetStack.peekLast().put(name, nextLocalOffset);
         return nextLocalOffset;
+    }
+
+    /**
+     * Look up a variable's offset without auto-creating.
+     * Returns null if the name is not found in any local scope.
+     */
+    private Integer lookupLocalOffset(String name) {
+        for (Map<String, Integer> scope : localOffsetStack) {
+            Integer off = scope.get(name);
+            if (off != null) return off;
+        }
+        return null;
     }
 
     // ========== Statement generation ==========
@@ -301,7 +342,9 @@ public class CodeGenerator {
     private void genStmt(Stmt stmt) {
         switch (stmt) {
             case Block b -> {
+                localOffsetStack.push(new HashMap<>());
                 for (Stmt s : b.stmts()) genStmt(s);
+                localOffsetStack.pop();
             }
             case NullStmt ignored -> {}
             case ExprStmt es -> {
@@ -310,16 +353,23 @@ public class CodeGenerator {
             }
             case AssignStmt as_ -> {
                 String r = genExpr(as_.value());
-                Symbol sym = analyzer.getGlobalScope().lookup(as_.name());
-                if (sym != null && sym.isGlobal() && !sym.isConst()) {
-                    // Store to global variable
-                    String addrReg = allocReg();
-                    emit("la", addrReg, sym.getName());
-                    emit("sw", r, "0(" + addrReg + ")");
-                    freeReg(addrReg);
+                // Check local scope first (handles shadowing of globals)
+                Integer localOff = lookupLocalOffset(as_.name());
+                if (localOff != null) {
+                    emit("sw", r, localOff + "(s0)");
                 } else {
-                    int offset = getLocalOffset(as_.name());
-                    emit("sw", r, offset + "(s0)");
+                    Symbol sym = analyzer.getGlobalScope().lookup(as_.name());
+                    if (sym != null && sym.isGlobal() && !sym.isConst()) {
+                        // Store to global variable
+                        String addrReg = allocReg();
+                        emit("la", addrReg, sym.getName());
+                        emit("sw", r, "0(" + addrReg + ")");
+                        freeReg(addrReg);
+                    } else {
+                        // Parameter or other local not yet allocated
+                        int offset = getLocalOffset(as_.name());
+                        emit("sw", r, offset + "(s0)");
+                    }
                 }
                 freeReg(r);
             }
@@ -445,7 +495,7 @@ public class CodeGenerator {
             emit("la", r, sym.getName());
             emit("lw", r, "0(" + r + ")");
         } else if (currentFuncIsLeaf && sym.getKind() == Symbol.Kind.PARAM
-                && !localOffset.containsKey(id.name())) {
+                && lookupLocalOffset(id.name()) == null) {
             // Leaf function: parameter kept in its original a-register
             // (not assigned to, not stored to stack).
             // Find which parameter index this is.
@@ -684,30 +734,46 @@ public class CodeGenerator {
             argSpillOffsets.add(-1); // -1 means "not spilled"
         }
 
-        // Phase 2: Move accumulated args to a0-a7, loading spilled ones.
-        // Compress out null entries (spilled args) and track spill offsets.
+        // Phase 2a: Load all spilled args back from spill slots.
+        // Track which args we move to a-regs early (to free up temp regs).
         int spillCursor = 0;
+        Set<Integer> alreadyMoved = new HashSet<>();
         for (int i = 0; i < argRegs.size(); i++) {
-            String reg = argRegs.get(i);
-            if (reg == null) {
-                // This arg was spilled; find its offset and load it
+            if (argRegs.get(i) == null) {
+                // If no free register, move a later held arg to its a-reg
+                // early to free up a temp register for loading the spill.
+                if (!hasFreeReg()) {
+                    for (int j = i + 1; j < argRegs.size(); j++) {
+                        String rj = argRegs.get(j);
+                        if (rj != null) {
+                            emit("mv", "a" + j, rj);
+                            freeReg(rj);
+                            alreadyMoved.add(j);
+                            break;
+                        }
+                    }
+                }
+                // Find spill offset for this spilled arg
                 while (spillCursor < argSpillOffsets.size() &&
                        argSpillOffsets.get(spillCursor) == -1) {
                     spillCursor++;
                 }
                 int off = argSpillOffsets.get(spillCursor);
-                reg = loadSpill(off);
-                freeSpillSlot(off); // recycle for reuse
+                String reg = loadSpill(off);
+                freeSpillSlot(off);
                 argRegs.set(i, reg);
                 spillCursor++;
             }
         }
 
+        // Phase 2b: Move remaining held args to a-regs
         for (int i = 0; i < argRegs.size(); i++) {
-            String reg = argRegs.get(i);
-            if (reg != null) {
-                emit("mv", "a" + i, reg);
-                freeReg(reg);
+            if (!alreadyMoved.contains(i)) {
+                String reg = argRegs.get(i);
+                if (reg != null) {
+                    emit("mv", "a" + i, reg);
+                    freeReg(reg);
+                }
             }
         }
 

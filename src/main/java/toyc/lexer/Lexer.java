@@ -74,10 +74,7 @@ public class Lexer {
             return readIdentifierOrKeyword();
         }
 
-        // Number (including negative numbers)
-        if (ch == '-' && pos + 1 < source.length() && Character.isDigit(source.charAt(pos + 1))) {
-            return readNumber();
-        }
+        // Number
         if (Character.isDigit(ch)) {
             return readNumber();
         }
@@ -177,22 +174,16 @@ public class Lexer {
     }
 
     /**
-     * Reads a NUMBER token. Per grammar: -?(0|[1-9][0-9]*)
+     * Reads a NUMBER token. Per grammar: (0|[1-9][0-9]*)
+     * Negative numbers are handled by the parser's unary minus operator.
      */
     private Token readNumber() {
         int startCol = column;
         int startLine = line;
         StringBuilder sb = new StringBuilder();
 
-        char ch = peek();
-
-        // Handle negative sign (only when followed by a digit)
-        if (ch == '-') {
-            sb.append(advance());
-        }
-
         // Read digits
-        ch = peek();
+        char ch = peek();
         if (ch == '0') {
             sb.append(advance());
         } else if (ch >= '1' && ch <= '9') {

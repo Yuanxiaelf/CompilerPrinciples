@@ -13,6 +13,11 @@ public class CodeGenerator {
 
     private final SemanticAnalyzer analyzer;
     private final boolean optimize;
+    // Register cache is disabled for now — it causes correctness issues
+    // in complex control flow (p01-p06 wrong output, p07-p10 timeout).
+    // The simpler optimizations (constant folding, mv elimination, addi,
+    // dead code) are safe and still provide good speedups.
+    private static final boolean enableRegCache = false;
     private final StringBuilder sb;
     private int labelCounter;
     private final Deque<LoopLabels> loopStack;
@@ -354,7 +359,7 @@ public class CodeGenerator {
 
     /** Cache a variable's value in a register. */
     private void cacheVar(String name, String reg) {
-        if (!optimize) return;
+        if (!optimize || !enableRegCache) return;
         // If this variable was previously cached in a different register,
         // free the old register.
         String oldReg = varRegCache.get(name);
@@ -495,10 +500,10 @@ public class CodeGenerator {
                         emit("sw", r, offset + "(s0)");
                     }
                 }
-                if (!optimize) {
+                if (!optimize || !enableRegCache) {
                     freeReg(r);
                 }
-                // With optimization, register stays cached
+                // With register cache enabled, register stays cached
             }
             case VarDecl vd -> {
                 // Dead code elimination: only skip if variable is never used
@@ -511,12 +516,12 @@ public class CodeGenerator {
                 }
                 String r = genExpr(vd.initExpr());
                 int offset = allocateLocal(vd.name());
-                if (optimize) {
+                if (optimize && enableRegCache) {
                     cacheVar(vd.name(), r);
                     varDirty.remove(vd.name()); // stored below
                 }
                 emit("sw", r, offset + "(s0)");
-                if (!optimize) {
+                if (!optimize || !enableRegCache) {
                     freeReg(r);
                 }
             }
@@ -531,12 +536,12 @@ public class CodeGenerator {
                 }
                 String r = genExpr(cd.initExpr());
                 int offset = allocateLocal(cd.name());
-                if (optimize) {
+                if (optimize && enableRegCache) {
                     cacheVar(cd.name(), r);
                     varDirty.remove(cd.name());
                 }
                 emit("sw", r, offset + "(s0)");
-                if (!optimize) {
+                if (!optimize || !enableRegCache) {
                     freeReg(r);
                 }
             }

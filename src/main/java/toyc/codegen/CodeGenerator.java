@@ -405,8 +405,8 @@ public class CodeGenerator {
         if (!optimize) return;
         // Flush dirty vars first to preserve their values in memory
         flushAllDirty();
-        // Free all cached registers
-        for (String reg : new ArrayList<>(regToVar.values())) {
+        // Free all cached registers (keys are register names like "t0")
+        for (String reg : new ArrayList<>(regToVar.keySet())) {
             freeRegRaw(reg);
         }
         varRegCache.clear();
@@ -501,12 +501,11 @@ public class CodeGenerator {
                 // With optimization, register stays cached
             }
             case VarDecl vd -> {
-                // Dead code elimination: if variable is never used, skip
-                if (optimize && !isVarUsed(vd.name(), currentFunc.body())) {
-                    if (hasSideEffects(vd.initExpr())) {
-                        String r = genExpr(vd.initExpr());
-                        freeReg(r);
-                    }
+                // Dead code elimination: only skip if variable is never used
+                // AND the initializer is pure (no side effects).
+                if (optimize && !isVarUsed(vd.name(), currentFunc.body())
+                        && isPureExpr(vd.initExpr())) {
+                    // Still allocate offset for frame size compatibility
                     allocateLocal(vd.name());
                     return;
                 }
@@ -1124,7 +1123,39 @@ public class CodeGenerator {
                 return TEMP_REGS[i];
             }
         }
+        // All temp registers are in use. If optimizing, evict a cached
+        // (non-dirty) variable to free one. Dirty vars must stay for correctness.
+        if (optimize) {
+            // Copy key set to avoid ConcurrentModificationException
+            for (String varName : new ArrayList<>(varRegCache.keySet())) {
+                if (!varDirty.contains(varName)) {
+                    // This var is clean (already stored to memory) — safe to evict.
+                    String reg = varRegCache.get(varName);
+                    if (reg != null) {
+                        varRegCache.remove(varName);
+                        regToVar.remove(reg);
+                        // Mark this register as allocated for the caller.
+                        tempUsed[regIndex(reg)] = true;
+                        return reg;
+                    }
+                }
+            }
+            // All cached vars are dirty — flush one then evict.
+            if (!varRegCache.isEmpty()) {
+                String varName = varRegCache.keySet().iterator().next();
+                invalidateVar(varName);
+                return allocReg();
+            }
+        }
         throw new RuntimeException("out of temporary registers");
+    }
+
+    /** Get the index of a temp register (0-6). */
+    private int regIndex(String reg) {
+        for (int i = 0; i < NUM_TEMPS; i++) {
+            if (TEMP_REGS[i].equals(reg)) return i;
+        }
+        return -1;
     }
 
     private boolean hasFreeReg() {

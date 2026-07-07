@@ -73,7 +73,7 @@ public class Main {
         }
 
         // Phase 5-7: Code generation
-        CodeGenerator codegen = new CodeGenerator(analyzer);
+        CodeGenerator codegen = new CodeGenerator(analyzer, optimize);
         String assembly = codegen.generate(ast);
 
         // Output assembly to stdout

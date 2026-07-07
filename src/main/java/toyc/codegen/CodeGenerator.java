@@ -12,6 +12,7 @@ import java.util.*;
 public class CodeGenerator {
 
     private final SemanticAnalyzer analyzer;
+    private final boolean optimize;
     private final StringBuilder sb;
     private int labelCounter;
     private final Deque<LoopLabels> loopStack;
@@ -30,11 +31,20 @@ public class CodeGenerator {
     // Frame info
     private int frameSize;
 
+    // Register cache for local variables (optimization)
+    // Maps variable name → register holding its current value
+    private final Map<String, String> varRegCache = new HashMap<>();
+    // Maps register → variable name (reverse mapping)
+    private final Map<String, String> regToVar = new HashMap<>();
+    // Tracks whether a cached variable has been stored to its stack slot
+    private final Set<String> varDirty = new HashSet<>();
+
     // Loop labels
     private record LoopLabels(String start, String end) {}
 
-    public CodeGenerator(SemanticAnalyzer analyzer) {
+    public CodeGenerator(SemanticAnalyzer analyzer, boolean optimize) {
         this.analyzer = analyzer;
+        this.optimize = optimize;
         this.sb = new StringBuilder();
         this.labelCounter = 0;
         this.loopStack = new ArrayDeque<>();
@@ -94,6 +104,9 @@ public class CodeGenerator {
         localOffsetStack.clear();
         localOffsetStack.push(new HashMap<>()); // function scope
         freeSpillSlots.clear();
+        varRegCache.clear();
+        regToVar.clear();
+        varDirty.clear();
         nextLocalOffset = -8; // skip past saved ra (-4) and saved fp (-8)
 
         // Count locals declared in the body
@@ -337,17 +350,107 @@ public class CodeGenerator {
         return null;
     }
 
+    // ========== Register cache for local variables (optimization) ==========
+
+    /** Cache a variable's value in a register. */
+    private void cacheVar(String name, String reg) {
+        if (!optimize) return;
+        // If this variable was previously cached in a different register,
+        // free the old register.
+        String oldReg = varRegCache.get(name);
+        if (oldReg != null && !oldReg.equals(reg)) {
+            regToVar.remove(oldReg);
+            freeRegRaw(oldReg);
+        }
+        // If this register was holding another variable, remove that mapping.
+        String oldVar = regToVar.get(reg);
+        if (oldVar != null && !oldVar.equals(name)) {
+            varRegCache.remove(oldVar);
+            varDirty.remove(oldVar);
+        }
+        varRegCache.put(name, reg);
+        regToVar.put(reg, name);
+        varDirty.add(name);
+    }
+
+    /** Get the register holding a variable's value, or null. */
+    private String getCachedReg(String name) {
+        if (!optimize) return null;
+        return varRegCache.get(name);
+    }
+
+    /** Flush (store to stack) a cached variable if dirty. */
+    private void flushVar(String name) {
+        if (!optimize) return;
+        if (!varDirty.contains(name)) return;
+        String reg = varRegCache.get(name);
+        if (reg == null) return;
+        Integer off = lookupLocalOffset(name);
+        if (off != null) {
+            emit("sw", reg, off + "(s0)");
+        }
+        varDirty.remove(name);
+    }
+
+    /** Flush all dirty cached variables to stack. */
+    private void flushAllDirty() {
+        if (!optimize) return;
+        for (String name : new ArrayList<>(varDirty)) {
+            flushVar(name);
+        }
+    }
+
+    /** Invalidate register cache (before function calls). */
+    private void invalidateRegCache() {
+        if (!optimize) return;
+        // Flush dirty vars first to preserve their values in memory
+        flushAllDirty();
+        // Free all cached registers
+        for (String reg : new ArrayList<>(regToVar.values())) {
+            freeRegRaw(reg);
+        }
+        varRegCache.clear();
+        regToVar.clear();
+        varDirty.clear();
+    }
+
+    /** Invalidate a specific variable from cache (when it goes out of scope). */
+    private void invalidateVar(String name) {
+        if (!optimize) return;
+        flushVar(name);
+        String reg = varRegCache.remove(name);
+        if (reg != null) {
+            regToVar.remove(reg);
+            freeRegRaw(reg);
+        }
+        varDirty.remove(name);
+    }
+
     // ========== Statement generation ==========
 
     private void genStmt(Stmt stmt) {
         switch (stmt) {
             case Block b -> {
                 localOffsetStack.push(new HashMap<>());
-                for (Stmt s : b.stmts()) genStmt(s);
+                // Track vars declared in this block for scope cleanup
+                Set<String> blockVars = new HashSet<>();
+                for (Stmt s : b.stmts()) {
+                    if (s instanceof VarDecl vd) blockVars.add(vd.name());
+                    else if (s instanceof ConstDecl cd) blockVars.add(cd.name());
+                    genStmt(s);
+                }
+                // Flush and invalidate block-scoped variables on exit
+                for (String name : blockVars) {
+                    invalidateVar(name);
+                }
                 localOffsetStack.pop();
             }
             case NullStmt ignored -> {}
             case ExprStmt es -> {
+                // Dead code elimination: if expression has no side effects, skip
+                if (optimize && isPureExpr(es.expr())) {
+                    return;
+                }
                 String r = genExpr(es.expr());
                 freeReg(r);
             }
@@ -356,6 +459,17 @@ public class CodeGenerator {
                 // Check local scope first (handles shadowing of globals)
                 Integer localOff = lookupLocalOffset(as_.name());
                 if (localOff != null) {
+                    if (optimize) {
+                        // Keep variable in its existing cached register if any
+                        String cachedReg = getCachedReg(as_.name());
+                        if (cachedReg != null && !cachedReg.equals(r)) {
+                            emit("mv", cachedReg, r);
+                            freeReg(r);
+                            r = cachedReg;
+                        }
+                        cacheVar(as_.name(), r);
+                        varDirty.remove(as_.name()); // stored below
+                    }
                     emit("sw", r, localOff + "(s0)");
                 } else {
                     Symbol sym = analyzer.getGlobalScope().lookup(as_.name());
@@ -368,22 +482,64 @@ public class CodeGenerator {
                     } else {
                         // Parameter or other local not yet allocated
                         int offset = getLocalOffset(as_.name());
+                        if (optimize) {
+                            String cachedReg = getCachedReg(as_.name());
+                            if (cachedReg != null && !cachedReg.equals(r)) {
+                                emit("mv", cachedReg, r);
+                                freeReg(r);
+                                r = cachedReg;
+                            }
+                            cacheVar(as_.name(), r);
+                            varDirty.remove(as_.name());
+                        }
                         emit("sw", r, offset + "(s0)");
                     }
                 }
-                freeReg(r);
+                if (!optimize) {
+                    freeReg(r);
+                }
+                // With optimization, register stays cached
             }
             case VarDecl vd -> {
+                // Dead code elimination: if variable is never used, skip
+                if (optimize && !isVarUsed(vd.name(), currentFunc.body())) {
+                    if (hasSideEffects(vd.initExpr())) {
+                        String r = genExpr(vd.initExpr());
+                        freeReg(r);
+                    }
+                    allocateLocal(vd.name());
+                    return;
+                }
                 String r = genExpr(vd.initExpr());
                 int offset = allocateLocal(vd.name());
+                if (optimize) {
+                    cacheVar(vd.name(), r);
+                    varDirty.remove(vd.name()); // stored below
+                }
                 emit("sw", r, offset + "(s0)");
-                freeReg(r);
+                if (!optimize) {
+                    freeReg(r);
+                }
             }
             case ConstDecl cd -> {
+                if (optimize && !isVarUsed(cd.name(), currentFunc.body())) {
+                    if (hasSideEffects(cd.initExpr())) {
+                        String r = genExpr(cd.initExpr());
+                        freeReg(r);
+                    }
+                    allocateLocal(cd.name());
+                    return;
+                }
                 String r = genExpr(cd.initExpr());
                 int offset = allocateLocal(cd.name());
+                if (optimize) {
+                    cacheVar(cd.name(), r);
+                    varDirty.remove(cd.name());
+                }
                 emit("sw", r, offset + "(s0)");
-                freeReg(r);
+                if (!optimize) {
+                    freeReg(r);
+                }
             }
             case IfStmt is -> genIf(is);
             case WhileStmt ws -> genWhile(ws);
@@ -445,6 +601,7 @@ public class CodeGenerator {
     }
 
     private void genReturn(ReturnStmt rs) {
+        flushAllDirty();
         if (rs.value() != null) {
             String r = genExpr(rs.value());
             emit("mv", "a0", r); // return value in a0
@@ -489,6 +646,18 @@ public class CodeGenerator {
             return r;
         }
 
+        // Optimization: check register cache first
+        if (optimize) {
+            String cachedReg = getCachedReg(id.name());
+            if (cachedReg != null) {
+                // Copy the cached value to a new register for this use.
+                // The cached register stays owned by the cache.
+                String r = allocReg();
+                emit("mv", r, cachedReg);
+                return r;
+            }
+        }
+
         String r = allocReg();
         if (sym.isGlobal()) {
             // Load from global address: la r, sym; lw r, 0(r)
@@ -525,12 +694,20 @@ public class CodeGenerator {
             return genLogicalOr(be);
         }
 
+        // Constant folding: if both operands are compile-time constants
+        if (optimize) {
+            Integer constVal = tryConstantFold(be);
+            if (constVal != null) {
+                String r = allocReg();
+                emit("li", r, String.valueOf(constVal));
+                return r;
+            }
+        }
+
         String leftReg = genExpr(be.left());
 
         // Only spill left if the right operand contains a function call
         // (which may clobber caller-saved temp registers t0-t6).
-        // For simple right operands (ids, literals, arithmetic), we can
-        // keep left in a register and avoid costly memory traffic.
         String rightReg;
         String resultReg;
 
@@ -541,14 +718,22 @@ public class CodeGenerator {
             freeReg(leftReg);
 
             rightReg = genExpr(be.right());
-            resultReg = loadSpill(spillOffset); // load spilled left as result
+            resultReg = loadSpill(spillOffset);
             freeSpillSlot(spillOffset);
         } else {
-            // Right operand has no calls — keep left in register.
+            // Right operand has no calls — reuse leftReg as result to avoid mv.
             rightReg = genExpr(be.right());
-            resultReg = allocReg();
-            emit("mv", resultReg, leftReg);
-            freeReg(leftReg);
+            resultReg = leftReg;
+            // Don't free leftReg — it's now resultReg
+        }
+
+        // Strength reduction: use immediate instructions when possible
+        if (optimize && be.right() instanceof LiteralExpr rle) {
+            int imm = rle.value();
+            if (tryEmitImmOp(be.op(), resultReg, resultReg, imm)) {
+                freeReg(rightReg);
+                return resultReg;
+            }
         }
 
         // resultReg holds left value; apply operator with rightReg
@@ -580,6 +765,67 @@ public class CodeGenerator {
         }
         freeReg(rightReg);
         return resultReg;
+    }
+
+    /** Try to evaluate a binary expression at compile time. */
+    private Integer tryConstantFold(BinaryExpr be) {
+        Integer l = getConstVal(be.left());
+        Integer r = getConstVal(be.right());
+        if (l == null || r == null) return null;
+        return switch (be.op()) {
+            case "+" -> l + r;
+            case "-" -> l - r;
+            case "*" -> l * r;
+            case "/" -> { if (r == 0) yield null; yield l / r; }
+            case "%" -> { if (r == 0) yield null; yield l % r; }
+            case "==" -> l.equals(r) ? 1 : 0;
+            case "!=" -> l.equals(r) ? 0 : 1;
+            case "<"  -> l < r ? 1 : 0;
+            case ">"  -> l > r ? 1 : 0;
+            case "<=" -> l <= r ? 1 : 0;
+            case ">=" -> l >= r ? 1 : 0;
+            default -> null;
+        };
+    }
+
+    /** Get constant value from an expression, or null. */
+    private Integer getConstVal(Expr expr) {
+        return switch (expr) {
+            case LiteralExpr le -> le.value();
+            case IdExpr id -> {
+                Symbol sym = analyzer.getIdSymbols().get(id);
+                if (sym != null && sym.isConst() && sym.getConstValue() != null)
+                    yield sym.getConstValue();
+                yield null;
+            }
+            case UnaryExpr ue -> {
+                Integer op = getConstVal(ue.operand());
+                if (op == null) yield null;
+                yield switch (ue.op()) {
+                    case "-" -> -op;
+                    case "!" -> (op == 0) ? 1 : 0;
+                    default -> op;
+                };
+            }
+            case BinaryExpr be -> tryConstantFold(be);
+            default -> null;
+        };
+    }
+
+    /** Try to emit an immediate-form instruction. Returns true if successful. */
+    private boolean tryEmitImmOp(String op, String rd, String rs, int imm) {
+        if (imm < -2048 || imm > 2047) return false;
+        switch (op) {
+            case "+" -> { emit("addi", rd, rs, String.valueOf(imm)); return true; }
+            case "-" -> { emit("addi", rd, rs, String.valueOf(-imm)); return true; }
+            case "<" -> { emit("slti", rd, rs, String.valueOf(imm)); return true; }
+            case ">=" -> {
+                emit("slti", rd, rs, String.valueOf(imm));
+                emit("xori", rd, rd, "1");
+                return true;
+            }
+            default -> { return false; }
+        }
     }
 
     /**
@@ -703,6 +949,12 @@ public class CodeGenerator {
     }
 
     private String genCall(CallExpr ce) {
+        // Before a call, flush register cache since caller-saved regs (t0-t6, a0-a7)
+        // will be clobbered.
+        if (optimize) {
+            invalidateRegCache();
+        }
+
         int numArgs = ce.args().size();
 
         // Phase 1: Evaluate all register args (0..min(numArgs,8)-1) into
@@ -808,6 +1060,61 @@ public class CodeGenerator {
         return resultReg;
     }
 
+    // ========== Optimization helpers ==========
+
+    /** Check if expression is pure (no side effects, no function calls). */
+    private boolean isPureExpr(Expr expr) {
+        return switch (expr) {
+            case LiteralExpr le -> true;
+            case IdExpr id -> true;
+            case BinaryExpr be -> isPureExpr(be.left()) && isPureExpr(be.right());
+            case UnaryExpr ue -> isPureExpr(ue.operand());
+            case CallExpr ce -> false; // function calls may have side effects
+        };
+    }
+
+    /** Check if expression has side effects (contains function calls). */
+    private boolean hasSideEffects(Expr expr) {
+        return !isPureExpr(expr);
+    }
+
+    /** Check if a variable name is used (read) in a given statement subtree. */
+    private boolean isVarUsed(String name, Stmt stmt) {
+        return switch (stmt) {
+            case Block b -> {
+                for (Stmt s : b.stmts())
+                    if (isVarUsed(name, s)) yield true;
+                yield false;
+            }
+            case ExprStmt es -> exprUsesVar(name, es.expr());
+            case AssignStmt as_ -> as_.name().equals(name) || exprUsesVar(name, as_.value());
+            case VarDecl vd -> exprUsesVar(name, vd.initExpr());
+            case ConstDecl cd -> exprUsesVar(name, cd.initExpr());
+            case IfStmt is -> exprUsesVar(name, is.condition())
+                    || isVarUsed(name, is.thenStmt())
+                    || (is.elseStmt() != null && isVarUsed(name, is.elseStmt()));
+            case WhileStmt ws -> exprUsesVar(name, ws.condition())
+                    || isVarUsed(name, ws.body());
+            case ReturnStmt rs -> rs.value() != null && exprUsesVar(name, rs.value());
+            default -> false;
+        };
+    }
+
+    /** Check if an expression references a variable name. */
+    private boolean exprUsesVar(String name, Expr expr) {
+        return switch (expr) {
+            case IdExpr id -> id.name().equals(name);
+            case BinaryExpr be -> exprUsesVar(name, be.left()) || exprUsesVar(name, be.right());
+            case UnaryExpr ue -> exprUsesVar(name, ue.operand());
+            case CallExpr ce -> {
+                for (Expr arg : ce.args())
+                    if (exprUsesVar(name, arg)) yield true;
+                yield false;
+            }
+            default -> false;
+        };
+    }
+
     // ========== Register allocation ==========
 
     private String allocReg() {
@@ -828,6 +1135,25 @@ public class CodeGenerator {
     }
 
     private void freeReg(String reg) {
+        for (int i = 0; i < NUM_TEMPS; i++) {
+            if (TEMP_REGS[i].equals(reg)) {
+                tempUsed[i] = false;
+                // If this register was cached for a variable, invalidate
+                // because the register no longer holds the variable's value.
+                if (optimize) {
+                    String var = regToVar.remove(reg);
+                    if (var != null) {
+                        varRegCache.remove(var);
+                        varDirty.remove(var);
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    /** Free a temp register without touching the cache. */
+    private void freeRegRaw(String reg) {
         for (int i = 0; i < NUM_TEMPS; i++) {
             if (TEMP_REGS[i].equals(reg)) {
                 tempUsed[i] = false;

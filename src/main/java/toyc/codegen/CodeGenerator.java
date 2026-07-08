@@ -13,7 +13,9 @@ public class CodeGenerator {
 
     private final SemanticAnalyzer analyzer;
     private final boolean optimize;
-    private static final int INTERPRETER_FUEL = 100_000_000;
+    private static final int INTERPRETER_FUEL = 8_000_000;
+    private static final long INTERPRETER_TIME_NS = 300_000_000L;
+    private static final int INTERPRETER_MAX_AST_NODES = 6000;
     // Register cache DISABLED: stable-register approach causes correctness
     // bugs (wrong output on p01-p05, timeouts on p06-p12). Requires proper
     // liveness analysis and SSA-based register allocation to work safely.
@@ -136,6 +138,9 @@ public class CodeGenerator {
 
     private Integer tryEvaluateMain(CompUnit compUnit) {
         try {
+            if (countAstNodes(compUnit) > INTERPRETER_MAX_AST_NODES) {
+                return null;
+            }
             ConstInterpreter interpreter = new ConstInterpreter(compUnit);
             return interpreter.runMain();
         } catch (ConstEvalBailout | ArithmeticException | StackOverflowError ignored) {
@@ -143,10 +148,44 @@ public class CodeGenerator {
         }
     }
 
+    private int countAstNodes(ASTNode node) {
+        if (node == null) return 0;
+        return switch (node) {
+            case CompUnit cu -> {
+                int n = 1;
+                for (ASTNode item : cu.items()) n += countAstNodes(item);
+                yield n;
+            }
+            case FuncDef fd -> 1 + countAstNodes(fd.body());
+            case Block b -> {
+                int n = 1;
+                for (Stmt s : b.stmts()) n += countAstNodes(s);
+                yield n;
+            }
+            case IfStmt is -> 1 + countAstNodes(is.condition())
+                    + countAstNodes(is.thenStmt()) + countAstNodes(is.elseStmt());
+            case WhileStmt ws -> 1 + countAstNodes(ws.condition()) + countAstNodes(ws.body());
+            case ReturnStmt rs -> 1 + countAstNodes(rs.value());
+            case ExprStmt es -> 1 + countAstNodes(es.expr());
+            case AssignStmt as_ -> 1 + countAstNodes(as_.value());
+            case VarDecl vd -> 1 + countAstNodes(vd.initExpr());
+            case ConstDecl cd -> 1 + countAstNodes(cd.initExpr());
+            case BinaryExpr be -> 1 + countAstNodes(be.left()) + countAstNodes(be.right());
+            case UnaryExpr ue -> 1 + countAstNodes(ue.operand());
+            case CallExpr ce -> {
+                int n = 1;
+                for (Expr arg : ce.args()) n += countAstNodes(arg);
+                yield n;
+            }
+            default -> 1;
+        };
+    }
+
     private final class ConstInterpreter {
         private final Map<String, FuncDef> funcs = new HashMap<>();
         private final IdentityHashMap<Symbol, Integer> globals = new IdentityHashMap<>();
         private int fuel = INTERPRETER_FUEL;
+        private final long deadlineNs = System.nanoTime() + INTERPRETER_TIME_NS;
         private int callDepth = 0;
 
         ConstInterpreter(CompUnit compUnit) {
@@ -232,13 +271,17 @@ public class CodeGenerator {
                     }
                 }
                 case WhileStmt ws -> {
-                    while (evalExpr(ws.condition(), frame) != 0) {
-                        try {
-                            execStmt(ws.body(), frame);
-                        } catch (ContinueSignal ignored) {
-                            // Continue with next condition check.
-                        } catch (BreakSignal ignored) {
-                            break;
+                    if (tryRunCountedLoop(ws, frame)) {
+                        // Loop was evaluated in bulk.
+                    } else {
+                        while (evalExpr(ws.condition(), frame) != 0) {
+                            try {
+                                execStmt(ws.body(), frame);
+                            } catch (ContinueSignal ignored) {
+                                // Continue with next condition check.
+                            } catch (BreakSignal ignored) {
+                                break;
+                            }
                         }
                     }
                 }
@@ -313,13 +356,224 @@ public class CodeGenerator {
         }
 
         private void tick() {
-            if (--fuel <= 0) throw new ConstEvalBailout();
+            if (--fuel <= 0 || (fuel & 0x3fff) == 0 && System.nanoTime() > deadlineNs) {
+                throw new ConstEvalBailout();
+            }
+        }
+
+        private boolean tryRunCountedLoop(WhileStmt ws, EvalFrame frame) {
+            if (!(ws.condition() instanceof BinaryExpr cond)) return false;
+            if (!(cond.left() instanceof IdExpr loopId)) return false;
+            if (!("<".equals(cond.op()) || "<=".equals(cond.op())
+                    || ">".equals(cond.op()) || ">=".equals(cond.op()))) return false;
+
+            Symbol loopSym = analyzer.getIdSymbols().get(loopId);
+            if (loopSym == null || exprUsesSymbol(cond.right(), loopSym)) return false;
+
+            List<Stmt> stmts;
+            if (ws.body() instanceof Block b) stmts = b.stmts();
+            else stmts = List.of(ws.body());
+
+            AssignStmt stepStmt = null;
+            int step = 0;
+            for (Stmt stmt : stmts) {
+                if (!(stmt instanceof AssignStmt as_)) return false;
+                Symbol target = analyzer.getAssignSymbols().get(as_);
+                if (target == loopSym) {
+                    if (stepStmt != null) return false;
+                    Integer parsedStep = parseSelfStep(as_.value(), loopSym);
+                    if (parsedStep == null || parsedStep == 0) return false;
+                    stepStmt = as_;
+                    step = parsedStep;
+                } else if (stmtContainsCall(stmt)) {
+                    return false;
+                }
+            }
+            if (stepStmt == null) return false;
+
+            int start = getValue(loopSym, frame);
+            int bound = evalExpr(cond.right(), frame);
+            long iterations = countIterations(start, bound, step, cond.op());
+            if (iterations < 0) return false;
+            if (iterations == 0) return true;
+
+            List<LoopUpdate> updates = new ArrayList<>();
+            for (Stmt stmt : stmts) {
+                AssignStmt as_ = (AssignStmt) stmt;
+                Symbol target = analyzer.getAssignSymbols().get(as_);
+                if (target == loopSym) continue;
+                LoopUpdate update = parseLoopUpdate(as_, target, loopSym, frame);
+                if (update == null) return false;
+                updates.add(update);
+            }
+
+            for (LoopUpdate update : updates) {
+                int old = getValue(update.target, frame);
+                long sumI = arithmeticSeries(start, step, iterations);
+                int delta = (int) (iterations * update.constant + sumI * update.coefficient);
+                setValue(update.target, old + delta, frame);
+            }
+            setValue(loopSym, (int) (start + iterations * step), frame);
+            tick();
+            return true;
+        }
+
+        private LoopUpdate parseLoopUpdate(AssignStmt stmt, Symbol target, Symbol loopSym, EvalFrame frame) {
+            Affine delta = extractSelfAffineDelta(stmt.value(), target, loopSym, frame);
+            return delta != null ? new LoopUpdate(target, delta.constant, delta.coefficient) : null;
+        }
+
+        private Affine extractSelfAffineDelta(Expr expr, Symbol target, Symbol loopSym, EvalFrame frame) {
+            if (isIdOf(expr, target)) return new Affine(0, 0);
+            if (expr instanceof BinaryExpr be) {
+                if ("+".equals(be.op())) {
+                    Affine leftSelf = extractSelfAffineDelta(be.left(), target, loopSym, frame);
+                    if (leftSelf != null) {
+                        Affine right = evalAffine(be.right(), loopSym, frame);
+                        return right != null
+                                ? new Affine(leftSelf.constant + right.constant,
+                                             leftSelf.coefficient + right.coefficient)
+                                : null;
+                    }
+                    Affine rightSelf = extractSelfAffineDelta(be.right(), target, loopSym, frame);
+                    if (rightSelf != null) {
+                        Affine left = evalAffine(be.left(), loopSym, frame);
+                        return left != null
+                                ? new Affine(left.constant + rightSelf.constant,
+                                             left.coefficient + rightSelf.coefficient)
+                                : null;
+                    }
+                } else if ("-".equals(be.op())) {
+                    Affine leftSelf = extractSelfAffineDelta(be.left(), target, loopSym, frame);
+                    if (leftSelf != null) {
+                        Affine right = evalAffine(be.right(), loopSym, frame);
+                        return right != null
+                                ? new Affine(leftSelf.constant - right.constant,
+                                             leftSelf.coefficient - right.coefficient)
+                                : null;
+                    }
+                }
+            }
+            return null;
+        }
+
+        private Affine evalAffine(Expr expr, Symbol loopSym, EvalFrame frame) {
+            return switch (expr) {
+                case LiteralExpr le -> new Affine(le.value(), 0);
+                case IdExpr id -> {
+                    Symbol sym = analyzer.getIdSymbols().get(id);
+                    if (sym == loopSym) yield new Affine(0, 1);
+                    if (sym == null) yield null;
+                    yield new Affine(getValue(sym, frame), 0);
+                }
+                case UnaryExpr ue -> {
+                    Affine a = evalAffine(ue.operand(), loopSym, frame);
+                    if (a == null) yield null;
+                    yield switch (ue.op()) {
+                        case "+" -> a;
+                        case "-" -> new Affine(-a.constant, -a.coefficient);
+                        default -> null;
+                    };
+                }
+                case BinaryExpr be -> {
+                    Affine l = evalAffine(be.left(), loopSym, frame);
+                    Affine r = evalAffine(be.right(), loopSym, frame);
+                    if (l == null || r == null) yield null;
+                    yield switch (be.op()) {
+                        case "+" -> new Affine(l.constant + r.constant, l.coefficient + r.coefficient);
+                        case "-" -> new Affine(l.constant - r.constant, l.coefficient - r.coefficient);
+                        case "*" -> {
+                            if (l.coefficient == 0) {
+                                yield new Affine(l.constant * r.constant, l.constant * r.coefficient);
+                            }
+                            if (r.coefficient == 0) {
+                                yield new Affine(l.constant * r.constant, l.coefficient * r.constant);
+                            }
+                            yield null;
+                        }
+                        default -> null;
+                    };
+                }
+                default -> null;
+            };
+        }
+
+        private Integer parseSelfStep(Expr expr, Symbol loopSym) {
+            if (!(expr instanceof BinaryExpr be)) return null;
+            if (isIdOf(be.left(), loopSym) && be.right() instanceof LiteralExpr lit) {
+                return switch (be.op()) {
+                    case "+" -> lit.value();
+                    case "-" -> -lit.value();
+                    default -> null;
+                };
+            }
+            if ("+".equals(be.op()) && isIdOf(be.right(), loopSym)
+                    && be.left() instanceof LiteralExpr lit) {
+                return lit.value();
+            }
+            return null;
+        }
+
+        private long countIterations(int start, int bound, int step, String op) {
+            if (step > 0) {
+                long distance = switch (op) {
+                    case "<" -> (long) bound - start;
+                    case "<=" -> (long) bound - start + 1L;
+                    default -> -1L;
+                };
+                if (distance <= 0) return 0;
+                return (distance + step - 1L) / step;
+            }
+            long posStep = -(long) step;
+            long distance = switch (op) {
+                case ">" -> (long) start - bound;
+                case ">=" -> (long) start - bound + 1L;
+                default -> -1L;
+            };
+            if (distance <= 0) return 0;
+            return (distance + posStep - 1L) / posStep;
+        }
+
+        private long arithmeticSeries(int start, int step, long n) {
+            return n * (2L * start + (n - 1L) * step) / 2L;
+        }
+
+        private boolean isIdOf(Expr expr, Symbol sym) {
+            return expr instanceof IdExpr id && analyzer.getIdSymbols().get(id) == sym;
+        }
+
+        private boolean exprUsesSymbol(Expr expr, Symbol sym) {
+            return switch (expr) {
+                case IdExpr id -> analyzer.getIdSymbols().get(id) == sym;
+                case BinaryExpr be -> exprUsesSymbol(be.left(), sym) || exprUsesSymbol(be.right(), sym);
+                case UnaryExpr ue -> exprUsesSymbol(ue.operand(), sym);
+                case CallExpr ce -> {
+                    for (Expr arg : ce.args()) if (exprUsesSymbol(arg, sym)) yield true;
+                    yield false;
+                }
+                default -> false;
+            };
+        }
+
+        private int getValue(Symbol sym, EvalFrame frame) {
+            if (sym.isConst() && sym.getConstValue() != null) return sym.getConstValue();
+            Integer value = sym.isGlobal() ? globals.get(sym) : frame.locals.get(sym);
+            if (value == null) throw new ConstEvalBailout();
+            return value;
+        }
+
+        private void setValue(Symbol sym, int value, EvalFrame frame) {
+            if (sym.isGlobal()) globals.put(sym, value);
+            else frame.locals.put(sym, value);
         }
     }
 
     private static final class EvalFrame {
         final IdentityHashMap<Symbol, Integer> locals = new IdentityHashMap<>();
     }
+
+    private record Affine(int constant, int coefficient) {}
+    private record LoopUpdate(Symbol target, int constant, int coefficient) {}
 
     private static class ConstEvalBailout extends RuntimeException {}
     private static final class BreakSignal extends RuntimeException {}

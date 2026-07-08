@@ -23,10 +23,16 @@ public class CodeGenerator {
     private final Deque<LoopLabels> loopStack;
 
     // Registers for expression evaluation.
-    // Seven caller-saved t-registers are always available as scratch.
+    // Primary temp registers: t0-t6 (7 caller-saved).
     private static final String[] TEMP_REGS = {"t0", "t1", "t2", "t3", "t4", "t5", "t6"};
     private static final int NUM_TEMPS = 7;
     private final boolean[] tempUsed = new boolean[NUM_TEMPS];
+
+    // Overflow temp registers: a0-a7 (8 caller-saved). Only used when
+    // all t-registers are exhausted. Must be freed before function calls.
+    private static final String[] A_REGS = {"a0","a1","a2","a3","a4","a5","a6","a7"};
+    private static final int NUM_A_REGS = 8;
+    private final boolean[] aRegUsed = new boolean[NUM_A_REGS];
 
     // S-registers available for persistent variable caching (callee-saved).
     // s0 is already used as frame pointer; s1-s11 are free.
@@ -143,6 +149,7 @@ public class CodeGenerator {
         usedSRegs.clear();
         sRegSaveOffset.clear();
         leakedSRegs.clear();
+        for (int i = 0; i < NUM_A_REGS; i++) aRegUsed[i] = false;
 
         // Determine whether this is a leaf function (no calls in body)
         boolean isLeaf = !stmtContainsCall(fd.body());
@@ -175,10 +182,14 @@ public class CodeGenerator {
             }
 
             // Detect shadowed names: if a name is declared in more than one
-            // scope, skip it. Otherwise the s-reg would hold the wrong
-            // variable's value for the inner/outer declaration.
+            // scope, skip it. Include parameters in the initial outer set
+            // so that local vars that shadow params are also detected.
+            Set<String> initialOuter = new HashSet<>();
+            if (funcSym != null && funcSym.getFuncParamNames() != null) {
+                initialOuter.addAll(funcSym.getFuncParamNames());
+            }
             Set<String> shadowedNames = new HashSet<>();
-            findShadowedNames(fd.body(), new HashSet<>(), shadowedNames);
+            findShadowedNames(fd.body(), initialOuter, shadowedNames);
 
             List<String> sortedVars = varUseCounts.entrySet().stream()
                 .filter(e -> e.getValue() >= 2) // only cache if used 2+ times
@@ -1051,7 +1062,7 @@ public class CodeGenerator {
                 case "/" -> { if (imm == 1) handled = true; }
                 case "%" -> {
                     if (imm == 1) { emit("mv", resultReg, "zero"); handled = true; }
-                    else if ((imm & (imm - 1)) == 0) {
+                    else if ((imm & (imm - 1)) == 0 && (imm - 1) <= 2047) {
                         emit("andi", resultReg, resultReg, String.valueOf(imm - 1));
                         handled = true;
                     }
@@ -1124,7 +1135,7 @@ public class CodeGenerator {
                         emit("mv", resultReg, "zero");
                         freeReg(rightReg); return resultReg;
                     }
-                    if ((imm & (imm - 1)) == 0) {
+                    if ((imm & (imm - 1)) == 0 && (imm - 1) <= 2047) {
                         emit("andi", resultReg, resultReg, String.valueOf(imm - 1));
                         freeReg(rightReg);
                         return resultReg;
@@ -1444,6 +1455,10 @@ public class CodeGenerator {
             invalidateRegCache();
             lastStoreReg.clear();
             regValid.clear();
+            // Also free all a-register temps (they're clobbered by the call).
+            for (int i = 0; i < NUM_A_REGS; i++) {
+                aRegUsed[i] = false;
+            }
         }
 
         int numArgs = ce.args().size();
@@ -1580,6 +1595,9 @@ public class CodeGenerator {
         int count = 0;
         for (int i = 0; i < NUM_TEMPS; i++) {
             if (!tempUsed[i]) count++;
+        }
+        for (int i = 0; i < NUM_A_REGS; i++) {
+            if (!aRegUsed[i]) count++;
         }
         return count;
     }
@@ -1724,6 +1742,13 @@ public class CodeGenerator {
                 return sReg;
             }
         }
+        // All t-reg fallbacks exhausted. Use a0-a7 as overflow temp regs.
+        for (int i = 0; i < NUM_A_REGS; i++) {
+            if (!aRegUsed[i]) {
+                aRegUsed[i] = true;
+                return A_REGS[i];
+            }
+        }
         throw new RuntimeException("out of temporary registers");
     }
 
@@ -1754,6 +1779,16 @@ public class CodeGenerator {
             }
             return;
         }
+        // a-registers (overflow temps)
+        if (reg.startsWith("a")) {
+            for (int i = 0; i < NUM_A_REGS; i++) {
+                if (A_REGS[i].equals(reg)) {
+                    aRegUsed[i] = false;
+                    return;
+                }
+            }
+            return;
+        }
         for (int i = 0; i < NUM_TEMPS; i++) {
             if (TEMP_REGS[i].equals(reg)) {
                 tempUsed[i] = false;
@@ -1772,8 +1807,16 @@ public class CodeGenerator {
 
     /** Free a temp register without touching the cache. */
     private void freeRegRaw(String reg) {
-        // s-registers are not tracked in tempUsed.
         if (reg.startsWith("s")) return;
+        if (reg.startsWith("a")) {
+            for (int i = 0; i < NUM_A_REGS; i++) {
+                if (A_REGS[i].equals(reg)) {
+                    aRegUsed[i] = false;
+                    return;
+                }
+            }
+            return;
+        }
         for (int i = 0; i < NUM_TEMPS; i++) {
             if (TEMP_REGS[i].equals(reg)) {
                 tempUsed[i] = false;

@@ -23,6 +23,7 @@ public class CodeGenerator {
     private static final boolean enableRegCache = false;
     private static final boolean enableBlockDce = false;
     private static final boolean enableInterpreterBranchBulk = false;
+    private static final boolean enableInterpreterModuloBranchBulk = true;
     private static final boolean enableGlobalAddrCache = false;
     private static final boolean enableSmallFunctionInline = false;
     private static final boolean enableWhileConstHoist = false;
@@ -740,7 +741,6 @@ public class CodeGenerator {
                     bulkStmts.add(new BulkUpdates(List.of(update)));
                     cumulativeUpdates.add(target);
                 } else if (stmt instanceof IfStmt is) {
-                    if (!enableInterpreterBranchBulk) return false;
                     if (exprUsesAnySymbol(is.condition(), assignedInLoop, null)) return false;
                     if (exprUsesAnySymbol(is.condition(), cumulativeUpdates, null)) return false;
                     Set<Symbol> branchAssigned = newIdentitySet();
@@ -751,12 +751,14 @@ public class CodeGenerator {
                     }
                     BulkCond bulkCond = parseBulkCondition(is.condition(), loopSym, frame);
                     if (bulkCond == null) return false;
+                    if (!isAllowedBranchBulk(bulkCond, branchAssigned)) return false;
                     List<LoopUpdate> thenUpdates = parseBranchUpdates(is.thenStmt(), loopSym, frame, assignedInLoop);
                     if (thenUpdates == null) return false;
                     List<LoopUpdate> elseUpdates = is.elseStmt() != null
                             ? parseBranchUpdates(is.elseStmt(), loopSym, frame, assignedInLoop)
                             : List.of();
                     if (elseUpdates == null) return false;
+                    if (!isSafeModuloBranchUpdates(branchAssigned, thenUpdates, elseUpdates)) return false;
                     bulkStmts.add(new BulkIf(bulkCond, thenUpdates, elseUpdates));
                     cumulativeUpdates.addAll(branchAssigned);
                 } else {
@@ -783,6 +785,32 @@ public class CodeGenerator {
             }
             setValue(loopSym, (int) (start + iterations * step), frame);
             tick();
+            return true;
+        }
+
+        private boolean isAllowedBranchBulk(BulkCond cond, Set<Symbol> branchAssigned) {
+            if (!enableInterpreterModuloBranchBulk || enableInterpreterBranchBulk) {
+                return enableInterpreterBranchBulk || (enableInterpreterModuloBranchBulk && cond instanceof BulkModuloCond);
+            }
+            if (!(cond instanceof BulkModuloCond)) return false;
+            if (branchAssigned.size() != 1) return false;
+            Symbol target = branchAssigned.iterator().next();
+            return target != null && !target.isGlobal() && !target.isConst() && !target.isFunc();
+        }
+
+        private boolean isSafeModuloBranchUpdates(Set<Symbol> branchAssigned,
+                                                  List<LoopUpdate> thenUpdates,
+                                                  List<LoopUpdate> elseUpdates) {
+            if (enableInterpreterBranchBulk) return true;
+            if (branchAssigned.size() != 1) return false;
+            Symbol target = branchAssigned.iterator().next();
+            if (thenUpdates.size() > 1 || elseUpdates.size() > 1) return false;
+            for (LoopUpdate update : thenUpdates) {
+                if (update.target != target || update.quadratic != 0) return false;
+            }
+            for (LoopUpdate update : elseUpdates) {
+                if (update.target != target || update.quadratic != 0) return false;
+            }
             return true;
         }
 
@@ -894,6 +922,7 @@ public class CodeGenerator {
             long sum = 0;
             int modulus = cond.modulus;
             int period = modulus / gcd(Math.abs(step), modulus);
+            if (period > 1_000_000) throw new ConstEvalBailout();
             int wanted = Math.floorMod(cond.remainder, modulus);
             for (int k = 0; k < period && k < iterations; k++) {
                 int value = start + k * step;

@@ -26,7 +26,7 @@ public class CodeGenerator {
     private static final String[] TEMP_REGS = {"t0", "t1", "t2", "t3", "t4", "t5", "t6"};
     private static final int NUM_TEMPS = 7;
     private final boolean[] tempUsed = new boolean[NUM_TEMPS];
-    // Overflow: a0-a7 (caller-saved), used only when t-regs exhausted.
+    // Overflow pool: a0-a7, used only when t-regs exhausted.
     private static final String[] A_REGS = {"a0","a1","a2","a3","a4","a5","a6","a7"};
     private static final int NUM_A_REGS = 8;
     private final boolean[] aUsed = new boolean[NUM_A_REGS];
@@ -718,13 +718,10 @@ public class CodeGenerator {
             if (paramIdx >= 0 && paramIdx < 8) {
                 emit("mv", r, "a" + paramIdx);
             } else if (paramIdx >= 8 && frameSize > 0) {
-                // Parameter 8+ arrives on the caller's outgoing arg area.
-                // After our prologue (addi sp,sp,-frameSize), extra args
-                // are at sp + frameSize + (paramIdx-8)*4.
                 int callerOff = frameSize + (paramIdx - 8) * 4;
                 emit("lw", r, callerOff + "(sp)");
             } else {
-                emit("li", r, "0"); // fallback (should not happen)
+                emit("li", r, "0");
             }
         } else {
             int offset = getLocalOffset(id.name());
@@ -869,40 +866,28 @@ public class CodeGenerator {
             case "<" -> { emit("slti", rd, rs, String.valueOf(imm)); return true; }
             case ">=" -> {
                 emit("slti", rd, rs, String.valueOf(imm));
-                emit("xori", rd, rd, "1");
-                return true;
+                emit("xori", rd, rd, "1"); return true;
             }
             case ">" -> {
                 if (imm < 2047) {
                     emit("slti", rd, rs, String.valueOf(imm + 1));
-                    emit("xori", rd, rd, "1");
-                    return true;
-                }
-                return false;
+                    emit("xori", rd, rd, "1"); return true;
+                } else return false;
             }
             case "<=" -> {
                 if (imm < 2047) {
                     emit("slti", rd, rs, String.valueOf(imm + 1));
                     return true;
-                }
-                return false;
+                } else return false;
             }
             case "==" -> {
-                if (imm == 0) {
-                    emit("seqz", rd, rs);
-                } else {
-                    emit("addi", rd, rs, String.valueOf(-imm));
-                    emit("seqz", rd, rd);
-                }
+                if (imm == 0) emit("seqz", rd, rs);
+                else { emit("addi", rd, rs, String.valueOf(-imm)); emit("seqz", rd, rd); }
                 return true;
             }
             case "!=" -> {
-                if (imm == 0) {
-                    emit("snez", rd, rs);
-                } else {
-                    emit("addi", rd, rs, String.valueOf(-imm));
-                    emit("snez", rd, rd);
-                }
+                if (imm == 0) emit("snez", rd, rs);
+                else { emit("addi", rd, rs, String.valueOf(-imm)); emit("snez", rd, rd); }
                 return true;
             }
             default -> { return false; }
@@ -1040,7 +1025,6 @@ public class CodeGenerator {
             invalidateRegCache();
             lastStoreReg.clear();
             regValid.clear();
-            // Also free a-reg overflow temps (clobbered by the call).
             for (int i = 0; i < NUM_A_REGS; i++) aUsed[i] = false;
         }
 
@@ -1287,7 +1271,7 @@ public class CodeGenerator {
                 return allocReg();
             }
         }
-        // Use a0-a7 as overflow temp registers.
+        // Overflow: use a0-a7 as additional temp registers.
         for (int i = 0; i < NUM_A_REGS; i++) {
             if (!aUsed[i]) { aUsed[i] = true; return A_REGS[i]; }
         }
@@ -1310,11 +1294,9 @@ public class CodeGenerator {
     }
 
     private void freeReg(String reg) {
-        // a-reg overflow
         if (reg.startsWith("a")) {
-            for (int i = 0; i < NUM_A_REGS; i++) {
+            for (int i = 0; i < NUM_A_REGS; i++)
                 if (A_REGS[i].equals(reg)) { aUsed[i] = false; return; }
-            }
             return;
         }
         for (int i = 0; i < NUM_TEMPS; i++) {
@@ -1323,10 +1305,7 @@ public class CodeGenerator {
                 regValid.remove(reg);
                 if (optimize) {
                     String var = regToVar.remove(reg);
-                    if (var != null) {
-                        varRegCache.remove(var);
-                        varDirty.remove(var);
-                    }
+                    if (var != null) { varRegCache.remove(var); varDirty.remove(var); }
                 }
                 return;
             }
@@ -1336,16 +1315,12 @@ public class CodeGenerator {
     /** Free a temp register without touching the cache. */
     private void freeRegRaw(String reg) {
         if (reg.startsWith("a")) {
-            for (int i = 0; i < NUM_A_REGS; i++) {
+            for (int i = 0; i < NUM_A_REGS; i++)
                 if (A_REGS[i].equals(reg)) { aUsed[i] = false; return; }
-            }
             return;
         }
         for (int i = 0; i < NUM_TEMPS; i++) {
-            if (TEMP_REGS[i].equals(reg)) {
-                tempUsed[i] = false;
-                return;
-            }
+            if (TEMP_REGS[i].equals(reg)) { tempUsed[i] = false; return; }
         }
     }
 

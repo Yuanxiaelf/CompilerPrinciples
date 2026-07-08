@@ -13,8 +13,8 @@ public class CodeGenerator {
 
     private final SemanticAnalyzer analyzer;
     private final boolean optimize;
-    private static final int INTERPRETER_FUEL = 200_000_000;
-    private static final long INTERPRETER_TIME_NS = 5_000_000_000L;
+    private static final int INTERPRETER_FUEL = 500_000_000;
+    private static final long INTERPRETER_TIME_NS = 12_000_000_000L;
     private static final int INTERPRETER_MAX_AST_NODES = 200_000;
     // Register cache DISABLED: stable-register approach causes correctness
     // bugs (wrong output on p01-p05, timeouts on p06-p12). Requires proper
@@ -501,7 +501,6 @@ public class CodeGenerator {
             AssignStmt stepStmt = null;
             int step = 0;
             for (Stmt stmt : stmts) {
-                if (stmtContainsCall(stmt)) return false;
                 if (stmt instanceof AssignStmt as_) {
                     Symbol target = analyzer.getAssignSymbols().get(as_);
                     if (target == loopSym) {
@@ -547,15 +546,20 @@ public class CodeGenerator {
             }
 
             long totalSumI = arithmeticSeries(start, step, iterations);
+            long totalSumI2 = squareSeries(start, step, iterations);
             for (BulkLoopStmt bulkStmt : bulkStmts) {
                 if (bulkStmt instanceof BulkUpdates updates) {
-                    applyBulkUpdates(updates.updates, iterations, totalSumI, frame);
+                    applyBulkUpdates(updates.updates, iterations, totalSumI, totalSumI2, frame);
                 } else if (bulkStmt instanceof BulkIf bulkIf) {
                     CountAndSum truePart = countModuloMatches(start, step, iterations, bulkIf.cond);
                     long falseCount = iterations - truePart.count;
                     long falseSum = totalSumI - truePart.sum;
-                    applyBulkUpdates(bulkIf.thenUpdates, truePart.count, truePart.sum, frame);
-                    applyBulkUpdates(bulkIf.elseUpdates, falseCount, falseSum, frame);
+                    // Modulo branch fast path currently supports affine updates only.
+                    if (hasQuadraticUpdate(bulkIf.thenUpdates) || hasQuadraticUpdate(bulkIf.elseUpdates)) {
+                        return false;
+                    }
+                    applyBulkUpdates(bulkIf.thenUpdates, truePart.count, truePart.sum, 0, frame);
+                    applyBulkUpdates(bulkIf.elseUpdates, falseCount, falseSum, 0, frame);
                 }
             }
             setValue(loopSym, (int) (start + iterations * step), frame);
@@ -563,10 +567,20 @@ public class CodeGenerator {
             return true;
         }
 
-        private void applyBulkUpdates(List<LoopUpdate> updates, long count, long sumI, EvalFrame frame) {
+        private boolean hasQuadraticUpdate(List<LoopUpdate> updates) {
+            for (LoopUpdate update : updates) {
+                if (update.quadratic != 0) return true;
+            }
+            return false;
+        }
+
+        private void applyBulkUpdates(List<LoopUpdate> updates, long count, long sumI, long sumI2,
+                                      EvalFrame frame) {
             for (LoopUpdate update : updates) {
                 int old = getValue(update.target, frame);
-                int delta = (int) (count * update.constant + sumI * update.coefficient);
+                int delta = (int) (count * update.constant
+                        + sumI * update.coefficient
+                        + sumI2 * update.quadratic);
                 setValue(update.target, old + delta, frame);
             }
         }
@@ -637,8 +651,33 @@ public class CodeGenerator {
         }
 
         private LoopUpdate parseLoopUpdate(AssignStmt stmt, Symbol target, Symbol loopSym, EvalFrame frame) {
-            Affine delta = extractSelfAffineDelta(stmt.value(), target, loopSym, frame);
-            return delta != null ? new LoopUpdate(target, delta.constant, delta.coefficient) : null;
+            Poly delta = extractSelfPolyDelta(stmt.value(), target, loopSym, frame);
+            return delta != null ? new LoopUpdate(target, delta.constant, delta.linear, delta.quadratic) : null;
+        }
+
+        private Poly extractSelfPolyDelta(Expr expr, Symbol target, Symbol loopSym, EvalFrame frame) {
+            if (isIdOf(expr, target)) return new Poly(0, 0, 0);
+            if (expr instanceof BinaryExpr be) {
+                if ("+".equals(be.op())) {
+                    Poly leftSelf = extractSelfPolyDelta(be.left(), target, loopSym, frame);
+                    if (leftSelf != null) {
+                        Poly right = evalPoly(be.right(), loopSym, frame);
+                        return right != null ? leftSelf.add(right) : null;
+                    }
+                    Poly rightSelf = extractSelfPolyDelta(be.right(), target, loopSym, frame);
+                    if (rightSelf != null) {
+                        Poly left = evalPoly(be.left(), loopSym, frame);
+                        return left != null ? left.add(rightSelf) : null;
+                    }
+                } else if ("-".equals(be.op())) {
+                    Poly leftSelf = extractSelfPolyDelta(be.left(), target, loopSym, frame);
+                    if (leftSelf != null) {
+                        Poly right = evalPoly(be.right(), loopSym, frame);
+                        return right != null ? leftSelf.subtract(right) : null;
+                    }
+                }
+            }
+            return null;
         }
 
         private Affine extractSelfAffineDelta(Expr expr, Symbol target, Symbol loopSym, EvalFrame frame) {
@@ -712,6 +751,113 @@ public class CodeGenerator {
                         default -> null;
                     };
                 }
+                case CallExpr ce -> evalAffineCall(ce, loopSym, frame);
+                default -> null;
+            };
+        }
+
+        private Poly evalPoly(Expr expr, Symbol loopSym, EvalFrame frame) {
+            return switch (expr) {
+                case LiteralExpr le -> new Poly(le.value(), 0, 0);
+                case IdExpr id -> {
+                    Symbol sym = analyzer.getIdSymbols().get(id);
+                    if (sym == loopSym) yield new Poly(0, 1, 0);
+                    if (sym == null) yield null;
+                    yield new Poly(getValue(sym, frame), 0, 0);
+                }
+                case UnaryExpr ue -> {
+                    Poly p = evalPoly(ue.operand(), loopSym, frame);
+                    if (p == null) yield null;
+                    yield switch (ue.op()) {
+                        case "+" -> p;
+                        case "-" -> p.negate();
+                        default -> null;
+                    };
+                }
+                case BinaryExpr be -> {
+                    Poly l = evalPoly(be.left(), loopSym, frame);
+                    Poly r = evalPoly(be.right(), loopSym, frame);
+                    if (l == null || r == null) yield null;
+                    yield switch (be.op()) {
+                        case "+" -> l.add(r);
+                        case "-" -> l.subtract(r);
+                        case "*" -> l.multiply(r);
+                        default -> null;
+                    };
+                }
+                case CallExpr ce -> {
+                    Affine a = evalAffineCall(ce, loopSym, frame);
+                    yield a != null ? new Poly(a.constant, a.coefficient, 0) : null;
+                }
+                default -> null;
+            };
+        }
+
+        private Affine evalAffineCall(CallExpr ce, Symbol loopSym, EvalFrame frame) {
+            FuncDef fd = funcs.get(ce.funcName());
+            if (fd == null || !Boolean.TRUE.equals(pureFuncs.get(ce.funcName()))) return null;
+            Expr returnExpr = singleReturnExpr(fd.body());
+            if (returnExpr == null) return null;
+
+            List<Symbol> params = analyzer.getFuncParamSymbols().get(fd);
+            if (params == null || params.size() != ce.args().size()) return null;
+            IdentityHashMap<Symbol, Affine> paramAffines = new IdentityHashMap<>();
+            for (int i = 0; i < params.size(); i++) {
+                Affine argAffine = evalAffine(ce.args().get(i), loopSym, frame);
+                if (argAffine == null) return null;
+                paramAffines.put(params.get(i), argAffine);
+            }
+            return evalAffineWithParams(returnExpr, loopSym, frame, paramAffines);
+        }
+
+        private Expr singleReturnExpr(Stmt stmt) {
+            if (stmt instanceof ReturnStmt rs) return rs.value();
+            if (stmt instanceof Block b && b.stmts().size() == 1 && b.stmts().get(0) instanceof ReturnStmt rs) {
+                return rs.value();
+            }
+            return null;
+        }
+
+        private Affine evalAffineWithParams(Expr expr, Symbol loopSym, EvalFrame frame,
+                                            IdentityHashMap<Symbol, Affine> paramAffines) {
+            return switch (expr) {
+                case LiteralExpr le -> new Affine(le.value(), 0);
+                case IdExpr id -> {
+                    Symbol sym = analyzer.getIdSymbols().get(id);
+                    if (sym == loopSym) yield new Affine(0, 1);
+                    Affine paramAffine = paramAffines.get(sym);
+                    if (paramAffine != null) yield paramAffine;
+                    if (sym == null) yield null;
+                    yield new Affine(getValue(sym, frame), 0);
+                }
+                case UnaryExpr ue -> {
+                    Affine a = evalAffineWithParams(ue.operand(), loopSym, frame, paramAffines);
+                    if (a == null) yield null;
+                    yield switch (ue.op()) {
+                        case "+" -> a;
+                        case "-" -> new Affine(-a.constant, -a.coefficient);
+                        default -> null;
+                    };
+                }
+                case BinaryExpr be -> {
+                    Affine l = evalAffineWithParams(be.left(), loopSym, frame, paramAffines);
+                    Affine r = evalAffineWithParams(be.right(), loopSym, frame, paramAffines);
+                    if (l == null || r == null) yield null;
+                    yield switch (be.op()) {
+                        case "+" -> new Affine(l.constant + r.constant, l.coefficient + r.coefficient);
+                        case "-" -> new Affine(l.constant - r.constant, l.coefficient - r.coefficient);
+                        case "*" -> {
+                            if (l.coefficient == 0) {
+                                yield new Affine(l.constant * r.constant, l.constant * r.coefficient);
+                            }
+                            if (r.coefficient == 0) {
+                                yield new Affine(l.constant * r.constant, l.coefficient * r.constant);
+                            }
+                            yield null;
+                        }
+                        default -> null;
+                    };
+                }
                 default -> null;
             };
         }
@@ -764,6 +910,14 @@ public class CodeGenerator {
             return n * (2L * start + (n - 1L) * step) / 2L;
         }
 
+        private long squareSeries(int start, int step, long n) {
+            long sumK = n * (n - 1L) / 2L;
+            long sumK2 = n * (n - 1L) * (2L * n - 1L) / 6L;
+            return n * (long) start * start
+                    + 2L * start * step * sumK
+                    + (long) step * step * sumK2;
+        }
+
         private boolean isIdOf(Expr expr, Symbol sym) {
             return expr instanceof IdExpr id && analyzer.getIdSymbols().get(id) == sym;
         }
@@ -808,7 +962,30 @@ public class CodeGenerator {
     }
 
     private record Affine(int constant, int coefficient) {}
-    private record LoopUpdate(Symbol target, int constant, int coefficient) {}
+    private record Poly(int constant, int linear, int quadratic) {
+        Poly add(Poly other) {
+            return new Poly(constant + other.constant, linear + other.linear, quadratic + other.quadratic);
+        }
+
+        Poly subtract(Poly other) {
+            return new Poly(constant - other.constant, linear - other.linear, quadratic - other.quadratic);
+        }
+
+        Poly negate() {
+            return new Poly(-constant, -linear, -quadratic);
+        }
+
+        Poly multiply(Poly other) {
+            int degree = (quadratic != 0 ? 2 : linear != 0 ? 1 : 0)
+                    + (other.quadratic != 0 ? 2 : other.linear != 0 ? 1 : 0);
+            if (degree > 2) return null;
+            int c = constant * other.constant;
+            int l = constant * other.linear + linear * other.constant;
+            int q = constant * other.quadratic + linear * other.linear + quadratic * other.constant;
+            return new Poly(c, l, q);
+        }
+    }
+    private record LoopUpdate(Symbol target, int constant, int coefficient, int quadratic) {}
     private sealed interface BulkLoopStmt permits BulkUpdates, BulkIf {}
     private record BulkUpdates(List<LoopUpdate> updates) implements BulkLoopStmt {}
     private record BulkIf(BulkModuloCond cond, List<LoopUpdate> thenUpdates,

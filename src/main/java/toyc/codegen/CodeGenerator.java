@@ -26,6 +26,10 @@ public class CodeGenerator {
     private static final String[] TEMP_REGS = {"t0", "t1", "t2", "t3", "t4", "t5", "t6"};
     private static final int NUM_TEMPS = 7;
     private final boolean[] tempUsed = new boolean[NUM_TEMPS];
+    // Overflow: a0-a7 (caller-saved), used only when t-regs exhausted.
+    private static final String[] A_REGS = {"a0","a1","a2","a3","a4","a5","a6","a7"};
+    private static final int NUM_A_REGS = 8;
+    private final boolean[] aUsed = new boolean[NUM_A_REGS];
 
     // Current function context
     private FuncDef currentFunc;
@@ -1036,6 +1040,8 @@ public class CodeGenerator {
             invalidateRegCache();
             lastStoreReg.clear();
             regValid.clear();
+            // Also free a-reg overflow temps (clobbered by the call).
+            for (int i = 0; i < NUM_A_REGS; i++) aUsed[i] = false;
         }
 
         int numArgs = ce.args().size();
@@ -1281,6 +1287,10 @@ public class CodeGenerator {
                 return allocReg();
             }
         }
+        // Use a0-a7 as overflow temp registers.
+        for (int i = 0; i < NUM_A_REGS; i++) {
+            if (!aUsed[i]) { aUsed[i] = true; return A_REGS[i]; }
+        }
         throw new RuntimeException("out of temporary registers");
     }
 
@@ -1300,12 +1310,17 @@ public class CodeGenerator {
     }
 
     private void freeReg(String reg) {
+        // a-reg overflow
+        if (reg.startsWith("a")) {
+            for (int i = 0; i < NUM_A_REGS; i++) {
+                if (A_REGS[i].equals(reg)) { aUsed[i] = false; return; }
+            }
+            return;
+        }
         for (int i = 0; i < NUM_TEMPS; i++) {
             if (TEMP_REGS[i].equals(reg)) {
                 tempUsed[i] = false;
-                // This register is being freed — any last-store value is gone
                 regValid.remove(reg);
-                // If this register was cached for a variable, invalidate
                 if (optimize) {
                     String var = regToVar.remove(reg);
                     if (var != null) {
@@ -1320,6 +1335,12 @@ public class CodeGenerator {
 
     /** Free a temp register without touching the cache. */
     private void freeRegRaw(String reg) {
+        if (reg.startsWith("a")) {
+            for (int i = 0; i < NUM_A_REGS; i++) {
+                if (A_REGS[i].equals(reg)) { aUsed[i] = false; return; }
+            }
+            return;
+        }
         for (int i = 0; i < NUM_TEMPS; i++) {
             if (TEMP_REGS[i].equals(reg)) {
                 tempUsed[i] = false;

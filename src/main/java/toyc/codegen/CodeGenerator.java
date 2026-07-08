@@ -13,6 +13,7 @@ public class CodeGenerator {
 
     private final SemanticAnalyzer analyzer;
     private final boolean optimize;
+    private static final int INTERPRETER_FUEL = 100_000_000;
     // Register cache DISABLED: stable-register approach causes correctness
     // bugs (wrong output on p01-p05, timeouts on p06-p12). Requires proper
     // liveness analysis and SSA-based register allocation to work safely.
@@ -37,6 +38,7 @@ public class CodeGenerator {
     // Current function context
     private FuncDef currentFunc;
     private boolean currentFuncIsLeaf;
+    private String currentFuncBodyLabel;
     private final Deque<Map<String, Integer>> localOffsetStack = new ArrayDeque<>(); // scoped variable → offset from fp
     private int nextLocalOffset; // grows downward (negative)
 
@@ -75,6 +77,19 @@ public class CodeGenerator {
     // ========== Entry point ==========
 
     public String generate(CompUnit compUnit) {
+        if (optimize) {
+            Integer foldedMain = tryEvaluateMain(compUnit);
+            if (foldedMain != null) {
+                emit(".text");
+                emit(".globl main");
+                emit("");
+                emitLabel("main");
+                emit("li", "a0", String.valueOf(foldedMain));
+                emit("ret");
+                return sb.toString();
+            }
+        }
+
         // Emit .data section for global variables/constants
         StringBuilder dataSection = new StringBuilder();
         boolean hasData = false;
@@ -119,10 +134,206 @@ public class CodeGenerator {
         return sb.toString();
     }
 
+    private Integer tryEvaluateMain(CompUnit compUnit) {
+        try {
+            ConstInterpreter interpreter = new ConstInterpreter(compUnit);
+            return interpreter.runMain();
+        } catch (ConstEvalBailout | ArithmeticException | StackOverflowError ignored) {
+            return null;
+        }
+    }
+
+    private final class ConstInterpreter {
+        private final Map<String, FuncDef> funcs = new HashMap<>();
+        private final IdentityHashMap<Symbol, Integer> globals = new IdentityHashMap<>();
+        private int fuel = INTERPRETER_FUEL;
+        private int callDepth = 0;
+
+        ConstInterpreter(CompUnit compUnit) {
+            for (ASTNode item : compUnit.items()) {
+                if (item instanceof FuncDef fd) {
+                    funcs.put(fd.name(), fd);
+                }
+            }
+            EvalFrame initFrame = new EvalFrame();
+            for (ASTNode item : compUnit.items()) {
+                if (item instanceof ConstDecl cd) {
+                    Symbol sym = analyzer.getConstDeclSymbols().get(cd);
+                    if (sym != null && sym.getConstValue() != null) {
+                        globals.put(sym, sym.getConstValue());
+                    }
+                } else if (item instanceof VarDecl vd) {
+                    Symbol sym = analyzer.getVarDeclSymbols().get(vd);
+                    if (sym != null) {
+                        globals.put(sym, evalExpr(vd.initExpr(), initFrame));
+                    }
+                }
+            }
+        }
+
+        Integer runMain() {
+            FuncDef main = funcs.get("main");
+            if (main == null || !main.params().isEmpty()) return null;
+            return call(main, List.of());
+        }
+
+        private int call(FuncDef fd, List<Integer> args) {
+            tick();
+            if (++callDepth > 10000) throw new ConstEvalBailout();
+            try {
+                EvalFrame frame = new EvalFrame();
+                List<Symbol> params = analyzer.getFuncParamSymbols().get(fd);
+                if (params == null || params.size() != args.size()) throw new ConstEvalBailout();
+                for (int i = 0; i < params.size(); i++) {
+                    frame.locals.put(params.get(i), args.get(i));
+                }
+                try {
+                    execStmt(fd.body(), frame);
+                } catch (ReturnSignal rs) {
+                    return rs.value;
+                }
+                return 0;
+            } finally {
+                callDepth--;
+            }
+        }
+
+        private void execStmt(Stmt stmt, EvalFrame frame) {
+            tick();
+            switch (stmt) {
+                case Block b -> {
+                    for (Stmt s : b.stmts()) execStmt(s, frame);
+                }
+                case NullStmt ignored -> {}
+                case ExprStmt es -> evalExpr(es.expr(), frame);
+                case AssignStmt as_ -> {
+                    Symbol sym = analyzer.getAssignSymbols().get(as_);
+                    if (sym == null) throw new ConstEvalBailout();
+                    int value = evalExpr(as_.value(), frame);
+                    if (sym.isGlobal()) globals.put(sym, value);
+                    else frame.locals.put(sym, value);
+                }
+                case VarDecl vd -> {
+                    Symbol sym = analyzer.getVarDeclSymbols().get(vd);
+                    if (sym == null) throw new ConstEvalBailout();
+                    frame.locals.put(sym, evalExpr(vd.initExpr(), frame));
+                }
+                case ConstDecl cd -> {
+                    Symbol sym = analyzer.getConstDeclSymbols().get(cd);
+                    if (sym != null && sym.getConstValue() != null) {
+                        frame.locals.put(sym, sym.getConstValue());
+                    }
+                }
+                case IfStmt is -> {
+                    if (evalExpr(is.condition(), frame) != 0) {
+                        execStmt(is.thenStmt(), frame);
+                    } else if (is.elseStmt() != null) {
+                        execStmt(is.elseStmt(), frame);
+                    }
+                }
+                case WhileStmt ws -> {
+                    while (evalExpr(ws.condition(), frame) != 0) {
+                        try {
+                            execStmt(ws.body(), frame);
+                        } catch (ContinueSignal ignored) {
+                            // Continue with next condition check.
+                        } catch (BreakSignal ignored) {
+                            break;
+                        }
+                    }
+                }
+                case BreakStmt ignored -> throw new BreakSignal();
+                case ContinueStmt ignored -> throw new ContinueSignal();
+                case ReturnStmt rs -> {
+                    int value = rs.value() != null ? evalExpr(rs.value(), frame) : 0;
+                    throw new ReturnSignal(value);
+                }
+                default -> throw new ConstEvalBailout();
+            }
+        }
+
+        private int evalExpr(Expr expr, EvalFrame frame) {
+            tick();
+            return switch (expr) {
+                case LiteralExpr le -> le.value();
+                case IdExpr id -> {
+                    Symbol sym = analyzer.getIdSymbols().get(id);
+                    if (sym == null) throw new ConstEvalBailout();
+                    if (sym.isConst() && sym.getConstValue() != null) yield sym.getConstValue();
+                    Integer value = sym.isGlobal() ? globals.get(sym) : frame.locals.get(sym);
+                    if (value == null) throw new ConstEvalBailout();
+                    yield value;
+                }
+                case UnaryExpr ue -> {
+                    int v = evalExpr(ue.operand(), frame);
+                    yield switch (ue.op()) {
+                        case "+" -> v;
+                        case "-" -> -v;
+                        case "!" -> v == 0 ? 1 : 0;
+                        default -> throw new ConstEvalBailout();
+                    };
+                }
+                case BinaryExpr be -> evalBinary(be, frame);
+                case CallExpr ce -> {
+                    FuncDef fd = funcs.get(ce.funcName());
+                    if (fd == null) throw new ConstEvalBailout();
+                    List<Integer> args = new ArrayList<>(ce.args().size());
+                    for (Expr arg : ce.args()) args.add(evalExpr(arg, frame));
+                    yield call(fd, args);
+                }
+            };
+        }
+
+        private int evalBinary(BinaryExpr be, EvalFrame frame) {
+            if ("&&".equals(be.op())) {
+                int left = evalExpr(be.left(), frame);
+                return left != 0 && evalExpr(be.right(), frame) != 0 ? 1 : 0;
+            }
+            if ("||".equals(be.op())) {
+                int left = evalExpr(be.left(), frame);
+                return left != 0 || evalExpr(be.right(), frame) != 0 ? 1 : 0;
+            }
+
+            int left = evalExpr(be.left(), frame);
+            int right = evalExpr(be.right(), frame);
+            return switch (be.op()) {
+                case "+" -> left + right;
+                case "-" -> left - right;
+                case "*" -> left * right;
+                case "/" -> left / right;
+                case "%" -> left % right;
+                case "==" -> left == right ? 1 : 0;
+                case "!=" -> left != right ? 1 : 0;
+                case "<" -> left < right ? 1 : 0;
+                case ">" -> left > right ? 1 : 0;
+                case "<=" -> left <= right ? 1 : 0;
+                case ">=" -> left >= right ? 1 : 0;
+                default -> throw new ConstEvalBailout();
+            };
+        }
+
+        private void tick() {
+            if (--fuel <= 0) throw new ConstEvalBailout();
+        }
+    }
+
+    private static final class EvalFrame {
+        final IdentityHashMap<Symbol, Integer> locals = new IdentityHashMap<>();
+    }
+
+    private static class ConstEvalBailout extends RuntimeException {}
+    private static final class BreakSignal extends RuntimeException {}
+    private static final class ContinueSignal extends RuntimeException {}
+    private static final class ReturnSignal extends RuntimeException {
+        final int value;
+        ReturnSignal(int value) { this.value = value; }
+    }
+
     // ========== Function definition ==========
 
     private void genFuncDef(FuncDef fd) {
         currentFunc = fd;
+        currentFuncBodyLabel = newLabel("func_body_" + fd.name());
         localOffsetStack.clear();
         localOffsetStack.push(new HashMap<>()); // function scope
         freeSpillSlots.clear();
@@ -274,6 +485,7 @@ public class CodeGenerator {
         }
 
         // Generate body
+        emitLabel(currentFuncBodyLabel);
         genStmt(fd.body());
 
         // Epilogue
@@ -291,6 +503,7 @@ public class CodeGenerator {
         emit("ret");
 
         currentFunc = null;
+        currentFuncBodyLabel = null;
     }
 
     private String funcEpilogueLabel() {
@@ -322,6 +535,7 @@ public class CodeGenerator {
 
         IdentityHashMap<Symbol, Integer> weights = new IdentityHashMap<>();
         collectSymbolWeights(fd.body(), weights, 0);
+        boolean tailRecursive = containsTailRecursiveReturn(fd.body(), fd.name());
 
         List<Symbol> paramSymbols = analyzer.getFuncParamSymbols().get(fd);
         if (paramSymbols != null) {
@@ -334,7 +548,7 @@ public class CodeGenerator {
         for (Map.Entry<Symbol, Integer> entry : weights.entrySet()) {
             Symbol sym = entry.getKey();
             if (sym == null || sym.isGlobal() || sym.isConst() || sym.isFunc()) continue;
-            if (entry.getValue() < 8) continue;
+            if (entry.getValue() < (tailRecursive ? 2 : 8)) continue;
             candidates.add(entry);
         }
         candidates.sort((a, b) -> Integer.compare(b.getValue(), a.getValue()));
@@ -402,6 +616,22 @@ public class CodeGenerator {
         weights.merge(sym, delta, Integer::sum);
     }
 
+    private boolean containsTailRecursiveReturn(Stmt stmt, String funcName) {
+        return switch (stmt) {
+            case Block b -> {
+                for (Stmt s : b.stmts()) {
+                    if (containsTailRecursiveReturn(s, funcName)) yield true;
+                }
+                yield false;
+            }
+            case IfStmt is -> containsTailRecursiveReturn(is.thenStmt(), funcName)
+                    || (is.elseStmt() != null && containsTailRecursiveReturn(is.elseStmt(), funcName));
+            case WhileStmt ws -> containsTailRecursiveReturn(ws.body(), funcName);
+            case ReturnStmt rs -> rs.value() instanceof CallExpr ce && ce.funcName().equals(funcName);
+            default -> false;
+        };
+    }
+
     /**
      * Count the maximum number of simultaneously-live spill slots needed
      * for binary expression evaluation. This equals the maximum depth
@@ -467,6 +697,9 @@ public class CodeGenerator {
                 int maxD = 0;
                 for (Expr arg : ce.args()) {
                     maxD = Math.max(maxD, calcMaxExprDepth(arg));
+                }
+                if (ce.args().size() > NUM_TEMPS) {
+                    yield maxD + ce.args().size();
                 }
                 // genCall may spill previously-evaluated register args
                 // before evaluating call-containing args. Conservative
@@ -811,6 +1044,9 @@ public class CodeGenerator {
     private void genReturn(ReturnStmt rs) {
         flushAllDirty();
         if (rs.value() != null) {
+            if (optimize && tryEmitTailRecursiveReturn(rs.value())) {
+                return;
+            }
             if (optimize && rs.value() instanceof LiteralExpr le) {
                 emit("li", "a0", String.valueOf(le.value()));
                 emit("j", funcEpilogueLabel());
@@ -836,6 +1072,84 @@ public class CodeGenerator {
         }
         // Jump to epilogue
         emit("j", funcEpilogueLabel());
+    }
+
+    private boolean tryEmitTailRecursiveReturn(Expr value) {
+        if (!(value instanceof CallExpr ce)) return false;
+        if (currentFunc == null || !currentFunc.name().equals(ce.funcName())) return false;
+
+        List<Symbol> paramSymbols = analyzer.getFuncParamSymbols().get(currentFunc);
+        if (paramSymbols == null || ce.args().size() != paramSymbols.size()) return false;
+
+        clearCallerSavedStateBeforeCall();
+
+        if (ce.args().size() <= NUM_TEMPS && !callArgsContainCall(ce)) {
+            String[] argRegs = new String[ce.args().size()];
+            for (int i = 0; i < ce.args().size(); i++) {
+                argRegs[i] = genExpr(ce.args().get(i));
+            }
+            assignTailArgsToParams(paramSymbols, argRegs);
+            emit("j", currentFuncBodyLabel);
+            return true;
+        }
+
+        int[] argSlots = new int[ce.args().size()];
+        for (int i = 0; i < ce.args().size(); i++) {
+            String r = genExpr(ce.args().get(i));
+            int slot = allocateSpillSlot();
+            spillReg(r, slot);
+            freeReg(r);
+            argSlots[i] = slot;
+        }
+
+        Symbol funcSym = analyzer.getFuncSymbols().get(currentFunc);
+        List<String> paramNames = funcSym != null ? funcSym.getFuncParamNames() : null;
+        for (int i = 0; i < paramSymbols.size(); i++) {
+            Symbol paramSym = paramSymbols.get(i);
+            String savedReg = symbolRegs.get(paramSym);
+            if (savedReg != null) {
+                emit("lw", savedReg, argSlots[i] + "(s0)");
+                freeSpillSlot(argSlots[i]);
+                continue;
+            }
+
+            String r = loadSpill(argSlots[i]);
+            freeSpillSlot(argSlots[i]);
+            String paramName = paramNames != null ? paramNames.get(i) : paramSym.getName();
+            int offset = getLocalOffset(paramName);
+            emit("sw", r, offset + "(s0)");
+            freeReg(r);
+        }
+
+        emit("j", currentFuncBodyLabel);
+        return true;
+    }
+
+    private boolean callArgsContainCall(CallExpr ce) {
+        for (Expr arg : ce.args()) {
+            if (exprContainsCall(arg)) return true;
+        }
+        return false;
+    }
+
+    private void assignTailArgsToParams(List<Symbol> paramSymbols, String[] argRegs) {
+        Symbol funcSym = analyzer.getFuncSymbols().get(currentFunc);
+        List<String> paramNames = funcSym != null ? funcSym.getFuncParamNames() : null;
+
+        for (int i = 0; i < paramSymbols.size(); i++) {
+            Symbol paramSym = paramSymbols.get(i);
+            String savedReg = symbolRegs.get(paramSym);
+            if (savedReg != null) {
+                if (!savedReg.equals(argRegs[i])) {
+                    emit("mv", savedReg, argRegs[i]);
+                }
+            } else {
+                String paramName = paramNames != null ? paramNames.get(i) : paramSym.getName();
+                int offset = getLocalOffset(paramName);
+                emit("sw", argRegs[i], offset + "(s0)");
+            }
+            freeReg(argRegs[i]);
+        }
     }
 
     private boolean tryEmitAssignToSavedReg(AssignStmt stmt, Symbol targetSym, String targetReg) {
@@ -1412,6 +1726,10 @@ public class CodeGenerator {
     }
 
     private String genCall(CallExpr ce) {
+        if (ce.args().size() > NUM_TEMPS) {
+            return genLargeCall(ce);
+        }
+
         // Before a call, clear last-store tracking since caller-saved regs
         // (t0-t6, a0-a7) will be clobbered. Must also free the underlying
         // temp registers, otherwise they stay marked as "used" forever.
@@ -1548,6 +1866,63 @@ public class CodeGenerator {
         String resultReg = allocReg();
         emit("mv", resultReg, "a0");
         return resultReg;
+    }
+
+    private String genLargeCall(CallExpr ce) {
+        clearCallerSavedStateBeforeCall();
+
+        int numArgs = ce.args().size();
+        int regArgCount = Math.min(numArgs, 8);
+        int[] argSpills = new int[numArgs];
+
+        for (int i = 0; i < numArgs; i++) {
+            String r = genExpr(ce.args().get(i));
+            int slot = allocateSpillSlot();
+            spillReg(r, slot);
+            freeReg(r);
+            argSpills[i] = slot;
+        }
+
+        for (int i = 0; i < regArgCount; i++) {
+            emit("lw", "a" + i, argSpills[i] + "(s0)");
+            freeSpillSlot(argSpills[i]);
+        }
+
+        int extraArgs = numArgs - 8;
+        int extraAlignedSize = 0;
+        if (extraArgs > 0) {
+            int extraSize = extraArgs * 4;
+            extraAlignedSize = (extraSize + 15) & ~15;
+            emit("addi", "sp", "sp", String.valueOf(-extraAlignedSize));
+            for (int i = 8; i < numArgs; i++) {
+                String r = loadSpill(argSpills[i]);
+                freeSpillSlot(argSpills[i]);
+                emit("sw", r, ((i - 8) * 4) + "(sp)");
+                freeReg(r);
+            }
+        }
+
+        emit("call", ce.funcName());
+
+        if (extraAlignedSize > 0) {
+            emit("addi", "sp", "sp", String.valueOf(extraAlignedSize));
+        }
+
+        String resultReg = allocReg();
+        emit("mv", resultReg, "a0");
+        return resultReg;
+    }
+
+    private void clearCallerSavedStateBeforeCall() {
+        if (optimize) {
+            for (String reg : lastStoreReg.values()) {
+                freeRegRaw(reg);
+            }
+            invalidateRegCache();
+            lastStoreReg.clear();
+            regValid.clear();
+            for (int i = 0; i < NUM_A_REGS; i++) aUsed[i] = false;
+        }
     }
 
     /** Count the number of free (unused) temp registers. */

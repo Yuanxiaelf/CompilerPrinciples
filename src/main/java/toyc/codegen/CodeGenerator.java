@@ -495,7 +495,7 @@ public class CodeGenerator {
                     Symbol target = analyzer.getAssignSymbols().get(as_);
                     if (target == null) return false;
                     if (target == info.loopSym) {
-                        Integer parsedStep = parseSelfStep(as_.value(), info.loopSym);
+                        Integer parsedStep = parseSelfStep(as_.value(), info.loopSym, frame);
                         if (parsedStep == null || parsedStep != info.step || sawStep) return false;
                         sawStep = true;
                         continue;
@@ -541,18 +541,36 @@ public class CodeGenerator {
             IdExpr loopId;
             Expr boundExpr;
             String condOp;
+            boolean dropLeadingGuard = false;
             if (ws.condition() instanceof BinaryExpr cond) {
-                if (!(cond.left() instanceof IdExpr id)) return null;
+                IdExpr id;
+                if (cond.left() instanceof IdExpr leftId) {
+                    id = leftId;
+                    boundExpr = cond.right();
+                    condOp = cond.op();
+                } else if (cond.right() instanceof IdExpr rightId) {
+                    id = rightId;
+                    boundExpr = cond.left();
+                    condOp = flipRelOp(cond.op());
+                } else {
+                    return null;
+                }
                 if (!("<".equals(cond.op()) || "<=".equals(cond.op())
                         || ">".equals(cond.op()) || ">=".equals(cond.op())
                         || "!=".equals(cond.op()))) return null;
                 loopId = id;
-                boundExpr = cond.right();
-                condOp = cond.op();
+                if (condOp == null) return null;
             } else if (ws.condition() instanceof IdExpr id) {
                 loopId = id;
                 boundExpr = new LiteralExpr(0, id.line());
                 condOp = "!=";
+            } else if (ws.condition() instanceof LiteralExpr le && le.value() != 0) {
+                LoopGuard guard = extractLeadingBreakGuard(ws.body());
+                if (guard == null) return null;
+                loopId = guard.loopId;
+                boundExpr = guard.boundExpr;
+                condOp = guard.continueOp;
+                dropLeadingGuard = true;
             } else {
                 return null;
             }
@@ -563,6 +581,9 @@ public class CodeGenerator {
             List<Stmt> stmts;
             if (ws.body() instanceof Block b) stmts = b.stmts();
             else stmts = List.of(ws.body());
+            if (dropLeadingGuard) {
+                stmts = stmts.subList(1, stmts.size());
+            }
 
             int step = 0;
             boolean sawStep = false;
@@ -571,7 +592,7 @@ public class CodeGenerator {
                     Symbol target = analyzer.getAssignSymbols().get(as_);
                     if (target == loopSym) {
                         if (sawStep) return null;
-                        Integer parsedStep = parseSelfStep(as_.value(), loopSym);
+                        Integer parsedStep = parseSelfStep(as_.value(), loopSym, frame);
                         if (parsedStep == null || parsedStep == 0) return null;
                         sawStep = true;
                         step = parsedStep;
@@ -584,6 +605,46 @@ public class CodeGenerator {
             long iterations = countIterations(start, bound, step, condOp);
             if (iterations < 0) return null;
             return new CountedLoopInfo(loopSym, stmts, start, step, iterations);
+        }
+
+        private LoopGuard extractLeadingBreakGuard(Stmt body) {
+            if (!(body instanceof Block b) || b.stmts().isEmpty()) return null;
+            if (!(b.stmts().get(0) instanceof IfStmt is)) return null;
+            if (!(is.thenStmt() instanceof BreakStmt) || is.elseStmt() != null) return null;
+            if (!(is.condition() instanceof BinaryExpr cond)) return null;
+            IdExpr id;
+            Expr boundExpr;
+            String breakOp = cond.op();
+            if (cond.left() instanceof IdExpr leftId) {
+                id = leftId;
+                boundExpr = cond.right();
+            } else if (cond.right() instanceof IdExpr rightId) {
+                id = rightId;
+                boundExpr = cond.left();
+                breakOp = flipRelOp(cond.op());
+            } else {
+                return null;
+            }
+            String continueOp = switch (breakOp) {
+                case ">=" -> "<";
+                case ">" -> "<=";
+                case "<=" -> ">";
+                case "<" -> ">=";
+                case "==" -> "!=";
+                default -> null;
+            };
+            return continueOp != null ? new LoopGuard(id, boundExpr, continueOp) : null;
+        }
+
+        private String flipRelOp(String op) {
+            return switch (op) {
+                case "<" -> ">";
+                case "<=" -> ">=";
+                case ">" -> "<";
+                case ">=" -> "<=";
+                case "!=", "==" -> op;
+                default -> null;
+            };
         }
 
         private boolean tryRunCountedLoop(WhileStmt ws, EvalFrame frame) {
@@ -620,7 +681,7 @@ public class CodeGenerator {
                     Symbol target = analyzer.getAssignSymbols().get(as_);
                     if (target == loopSym) {
                         if (stepStmt != null) return false;
-                        Integer parsedStep = parseSelfStep(as_.value(), loopSym);
+                        Integer parsedStep = parseSelfStep(as_.value(), loopSym, frame);
                         if (parsedStep == null || parsedStep == 0) return false;
                         stepStmt = as_;
                         step = parsedStep;
@@ -1043,18 +1104,19 @@ public class CodeGenerator {
             };
         }
 
-        private Integer parseSelfStep(Expr expr, Symbol loopSym) {
+        private Integer parseSelfStep(Expr expr, Symbol loopSym, EvalFrame frame) {
             if (!(expr instanceof BinaryExpr be)) return null;
-            if (isIdOf(be.left(), loopSym) && be.right() instanceof LiteralExpr lit) {
+            if (isIdOf(be.left(), loopSym) && !exprUsesSymbol(be.right(), loopSym)) {
+                int delta = evalExpr(be.right(), frame);
                 return switch (be.op()) {
-                    case "+" -> lit.value();
-                    case "-" -> -lit.value();
+                    case "+" -> delta;
+                    case "-" -> -delta;
                     default -> null;
                 };
             }
             if ("+".equals(be.op()) && isIdOf(be.right(), loopSym)
-                    && be.left() instanceof LiteralExpr lit) {
-                return lit.value();
+                    && !exprUsesSymbol(be.left(), loopSym)) {
+                return evalExpr(be.left(), frame);
             }
             return null;
         }
@@ -1172,6 +1234,7 @@ public class CodeGenerator {
     }
     private record LoopUpdate(Symbol target, int constant, int coefficient, int quadratic) {}
     private record CountedLoopInfo(Symbol loopSym, List<Stmt> stmts, int start, int step, long iterations) {}
+    private record LoopGuard(IdExpr loopId, Expr boundExpr, String continueOp) {}
     private sealed interface BulkLoopStmt permits BulkUpdates, BulkIf {}
     private record BulkUpdates(List<LoopUpdate> updates) implements BulkLoopStmt {}
     private record BulkIf(BulkModuloCond cond, List<LoopUpdate> thenUpdates,

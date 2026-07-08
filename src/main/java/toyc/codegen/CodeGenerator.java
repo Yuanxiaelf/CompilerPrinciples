@@ -22,6 +22,9 @@ public class CodeGenerator {
     // The simpler optimizations below are safe and still provide good speedups.
     private static final boolean enableRegCache = false;
     private static final boolean enableBlockDce = false;
+    private static final boolean enableInterpreterBranchBulk = false;
+    private static final boolean enableGlobalAddrCache = false;
+    private static final boolean enableSmallFunctionInline = false;
     private final StringBuilder sb;
     private int labelCounter;
     private final Deque<LoopLabels> loopStack;
@@ -494,16 +497,9 @@ public class CodeGenerator {
 
             for (Stmt stmt : info.stmts) {
                 if (stmt instanceof VarDecl vd) {
-                    if (exprUsesAnySymbol(vd.initExpr(), cumulativeUpdates, null)) return false;
-                    Symbol target = analyzer.getVarDeclSymbols().get(vd);
-                    Poly value = evalPolyWithEnv(vd.initExpr(), info.loopSym, frame, env);
-                    if (target == null || value == null) return false;
-                    env.put(target, value);
+                    return false;
                 } else if (stmt instanceof ConstDecl cd) {
-                    Symbol target = analyzer.getConstDeclSymbols().get(cd);
-                    if (target != null && target.getConstValue() != null) {
-                        env.put(target, new Poly(target.getConstValue(), 0, 0));
-                    }
+                    return false;
                 } else if (stmt instanceof AssignStmt as_) {
                     Symbol target = analyzer.getAssignSymbols().get(as_);
                     if (target == null) return false;
@@ -515,12 +511,7 @@ public class CodeGenerator {
                     }
 
                     if (env.containsKey(target)) {
-                        if (exprUsesAnySymbol(as_.value(), cumulativeUpdates, null)) return false;
-                        Poly value = evalPolyWithEnv(as_.value(), info.loopSym, frame, env);
-                        if (value == null) return false;
-                        env.put(target, value);
-                        finalAssignments.put(target, value);
-                        continue;
+                        return false;
                     }
 
                     Poly delta = extractSelfPolyDeltaWithEnv(as_.value(), target, info.loopSym, frame, env);
@@ -529,13 +520,7 @@ public class CodeGenerator {
                         updates.add(new LoopUpdate(target, delta.constant, delta.linear, delta.quadratic));
                         cumulativeUpdates.add(target);
                     } else {
-                        if (cumulativeUpdates.contains(target)) return false;
-                        if (exprUsesSymbol(as_.value(), target)) return false;
-                        if (exprUsesAnySymbol(as_.value(), cumulativeUpdates, null)) return false;
-                        Poly value = evalPolyWithEnv(as_.value(), info.loopSym, frame, env);
-                        if (value == null) return false;
-                        env.put(target, value);
-                        finalAssignments.put(target, value);
+                        return false;
                     }
                 } else {
                     return false;
@@ -752,6 +737,7 @@ public class CodeGenerator {
                     bulkStmts.add(new BulkUpdates(List.of(update)));
                     cumulativeUpdates.add(target);
                 } else if (stmt instanceof IfStmt is) {
+                    if (!enableInterpreterBranchBulk) return false;
                     if (exprUsesAnySymbol(is.condition(), assignedInLoop, null)) return false;
                     if (exprUsesAnySymbol(is.condition(), cumulativeUpdates, null)) return false;
                     Set<Symbol> branchAssigned = newIdentitySet();
@@ -1747,7 +1733,7 @@ public class CodeGenerator {
     }
 
     private void assignGlobalAddressRegisters(FuncDef fd) {
-        if (!optimize) return;
+        if (!optimize || !enableGlobalAddrCache) return;
 
         int base = symbolRegs.size();
         if (base >= SAVED_VALUE_REGS.length) return;
@@ -3282,7 +3268,7 @@ public class CodeGenerator {
     }
 
     private String genCall(CallExpr ce) {
-        if (optimize) {
+        if (optimize && enableSmallFunctionInline) {
             String inlined = tryGenInlineCall(ce);
             if (inlined != null) return inlined;
         }
@@ -3461,7 +3447,7 @@ public class CodeGenerator {
     }
 
     private boolean canInlineCall(CallExpr ce) {
-        if (!optimize) return false;
+        if (!optimize || !enableSmallFunctionInline) return false;
         FuncDef fd = functionsByName.get(ce.funcName());
         if (fd == null || fd == currentFunc) return false;
         Expr returnExpr = singleReturnExpr(fd.body());

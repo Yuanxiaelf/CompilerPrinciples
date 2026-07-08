@@ -13,8 +13,8 @@ public class CodeGenerator {
 
     private final SemanticAnalyzer analyzer;
     private final boolean optimize;
-    private static final int INTERPRETER_FUEL = 500_000_000;
-    private static final long INTERPRETER_TIME_NS = 12_000_000_000L;
+    private static final int INTERPRETER_FUEL = 60_000_000;
+    private static final long INTERPRETER_TIME_NS = 2_000_000_000L;
     private static final int INTERPRETER_MAX_AST_NODES = 200_000;
     // Register cache DISABLED: stable-register approach causes correctness
     // bugs (wrong output on p01-p05, timeouts on p06-p12). Requires proper
@@ -1965,10 +1965,7 @@ public class CodeGenerator {
         String elseLabel = newLabel("else");
         String endLabel = newLabel("if_end");
 
-        // Condition: non-zero is true
-        String condReg = genExpr(is.condition());
-        emit("beqz", condReg, is.elseStmt() != null ? elseLabel : endLabel);
-        freeReg(condReg);
+        genBranchIfFalse(is.condition(), is.elseStmt() != null ? elseLabel : endLabel);
 
         // Then branch
         genStmt(is.thenStmt());
@@ -1989,9 +1986,7 @@ public class CodeGenerator {
         loopStack.push(new LoopLabels(startLabel, endLabel));
 
         emitLabel(startLabel);
-        String condReg = genExpr(ws.condition());
-        emit("beqz", condReg, endLabel);
-        freeReg(condReg);
+        genBranchIfFalse(ws.condition(), endLabel);
 
         emitLabel(bodyLabel);
         codegenLoopDepth++;
@@ -2034,6 +2029,99 @@ public class CodeGenerator {
         }
         // Jump to epilogue
         emit("j", funcEpilogueLabel());
+    }
+
+    private void genBranchIfFalse(Expr expr, String label) {
+        if (expr instanceof UnaryExpr ue && "!".equals(ue.op())) {
+            genBranchIfTrue(ue.operand(), label);
+            return;
+        }
+        if (expr instanceof BinaryExpr be) {
+            if ("&&".equals(be.op())) {
+                genBranchIfFalse(be.left(), label);
+                genBranchIfFalse(be.right(), label);
+                return;
+            }
+            if ("||".equals(be.op())) {
+                String endLabel = newLabel("lor_true");
+                genBranchIfTrue(be.left(), endLabel);
+                genBranchIfFalse(be.right(), label);
+                emitLabel(endLabel);
+                return;
+            }
+            if (isCompareOp(be.op()) && !exprContainsCall(be.left()) && !exprContainsCall(be.right())) {
+                emitCompareBranch(be.op(), false, be.left(), be.right(), label);
+                return;
+            }
+        }
+
+        String r = genExpr(expr);
+        emit("beqz", r, label);
+        freeReg(r);
+    }
+
+    private void genBranchIfTrue(Expr expr, String label) {
+        if (expr instanceof UnaryExpr ue && "!".equals(ue.op())) {
+            genBranchIfFalse(ue.operand(), label);
+            return;
+        }
+        if (expr instanceof BinaryExpr be) {
+            if ("&&".equals(be.op())) {
+                String falseLabel = newLabel("land_false");
+                genBranchIfFalse(be.left(), falseLabel);
+                genBranchIfTrue(be.right(), label);
+                emitLabel(falseLabel);
+                return;
+            }
+            if ("||".equals(be.op())) {
+                genBranchIfTrue(be.left(), label);
+                genBranchIfTrue(be.right(), label);
+                return;
+            }
+            if (isCompareOp(be.op()) && !exprContainsCall(be.left()) && !exprContainsCall(be.right())) {
+                emitCompareBranch(be.op(), true, be.left(), be.right(), label);
+                return;
+            }
+        }
+
+        String r = genExpr(expr);
+        emit("bnez", r, label);
+        freeReg(r);
+    }
+
+    private boolean isCompareOp(String op) {
+        return "==".equals(op) || "!=".equals(op) || "<".equals(op)
+                || ">".equals(op) || "<=".equals(op) || ">=".equals(op);
+    }
+
+    private void emitCompareBranch(String op, boolean branchOnTrue, Expr left, Expr right, String label) {
+        String l = genExpr(left);
+        String r = genExpr(right);
+
+        if (branchOnTrue) {
+            switch (op) {
+                case "==" -> emit("beq", l, r, label);
+                case "!=" -> emit("bne", l, r, label);
+                case "<" -> emit("blt", l, r, label);
+                case ">" -> emit("blt", r, l, label);
+                case "<=" -> emit("bge", r, l, label);
+                case ">=" -> emit("bge", l, r, label);
+                default -> {}
+            }
+        } else {
+            switch (op) {
+                case "==" -> emit("bne", l, r, label);
+                case "!=" -> emit("beq", l, r, label);
+                case "<" -> emit("bge", l, r, label);
+                case ">" -> emit("bge", r, l, label);
+                case "<=" -> emit("blt", r, l, label);
+                case ">=" -> emit("blt", l, r, label);
+                default -> {}
+            }
+        }
+
+        freeReg(r);
+        freeReg(l);
     }
 
     private List<Set<Symbol>> buildSuffixUses(List<Stmt> stmts) {

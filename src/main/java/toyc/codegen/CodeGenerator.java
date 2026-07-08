@@ -686,17 +686,16 @@ public class CodeGenerator {
             return r;
         }
 
-        // Last-store optimization: if variable was just stored and its
-        // register hasn't been reused, use it directly (avoid lw).
+        // Persistent last-store cache: if variable's register is still
+        // valid, copy it to a new temp register without consuming.
+        // The cache survives multiple reads until the register is
+        // stolen by allocReg or the variable is reassigned.
         if (optimize) {
             String lsReg = lastStoreReg.get(id.name());
             if (lsReg != null && regValid.contains(lsReg)) {
-                // Register still holds the value — use it and consume.
-                regValid.remove(lsReg);
-                lastStoreReg.remove(id.name());
-                // Mark this register as allocated for the caller.
-                tempUsed[regIndex(lsReg)] = true;
-                return lsReg;
+                String r = allocReg();
+                emit("mv", r, lsReg);
+                return r;
             }
         }
 
@@ -772,12 +771,47 @@ public class CodeGenerator {
             // Don't free leftReg — it's now resultReg
         }
 
-        // Strength reduction: use immediate instructions when possible
-        if (optimize && be.right() instanceof LiteralExpr rle) {
-            int imm = rle.value();
-            if (tryEmitImmOp(be.op(), resultReg, resultReg, imm)) {
-                freeReg(rightReg);
-                return resultReg;
+        // Algebraic identities and strength reduction
+        if (optimize) {
+            // Right-side literal identities
+            if (be.right() instanceof LiteralExpr rle) {
+                int imm = rle.value();
+                boolean handled = false;
+                switch (be.op()) {
+                    case "+" -> { if (imm == 0) handled = true; }
+                    case "-" -> { if (imm == 0) handled = true; }
+                    case "*" -> {
+                        if (imm == 0) { emit("mv", resultReg, "zero"); handled = true; }
+                        else if (imm == 1) handled = true;
+                        else if ((imm & (imm - 1)) == 0 && imm > 0) {
+                            emit("slli", resultReg, resultReg,
+                                 String.valueOf(Integer.numberOfTrailingZeros(imm)));
+                            handled = true;
+                        }
+                    }
+                    case "/" -> { if (imm == 1) handled = true; }
+                    case "%" -> { if (imm == 1) { emit("mv", resultReg, "zero"); handled = true; } }
+                }
+                if (handled) { freeReg(rightReg); return resultReg; }
+                if (tryEmitImmOp(be.op(), resultReg, resultReg, imm)) {
+                    freeReg(rightReg); return resultReg;
+                }
+            }
+            // Left-side literal commutative identities
+            if (be.left() instanceof LiteralExpr lle) {
+                int imm = lle.value();
+                boolean handled = false;
+                switch (be.op()) {
+                    case "+" -> { if (imm == 0) { freeReg(resultReg); return rightReg; } }
+                    case "*" -> {
+                        if (imm == 0) { emit("mv", resultReg, "zero"); handled = true; }
+                        else if (imm == 1) { freeReg(resultReg); return rightReg; }
+                    }
+                    case "-" -> {
+                        if (imm == 0) { emit("sub", resultReg, "zero", rightReg); handled = true; }
+                    }
+                }
+                if (handled) { freeReg(rightReg); return resultReg; }
             }
         }
 

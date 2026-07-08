@@ -18,6 +18,10 @@ public class SemanticAnalyzer {
     private final Map<Expr, Type> exprTypes = new HashMap<>();
     private final Map<IdExpr, Symbol> idSymbols = new HashMap<>();
     private final Map<FuncDef, Symbol> funcSymbols = new HashMap<>();
+    private final Map<FuncDef, List<Symbol>> funcParamSymbols = new HashMap<>();
+    private final Map<VarDecl, Symbol> varDeclSymbols = new HashMap<>();
+    private final Map<ConstDecl, Symbol> constDeclSymbols = new HashMap<>();
+    private final Map<AssignStmt, Symbol> assignSymbols = new HashMap<>();
 
     // For tracking function return checking
     private String currentFuncReturnType;
@@ -38,6 +42,10 @@ public class SemanticAnalyzer {
     public Map<Expr, Type> getExprTypes() { return exprTypes; }
     public Map<IdExpr, Symbol> getIdSymbols() { return idSymbols; }
     public Map<FuncDef, Symbol> getFuncSymbols() { return funcSymbols; }
+    public Map<FuncDef, List<Symbol>> getFuncParamSymbols() { return funcParamSymbols; }
+    public Map<VarDecl, Symbol> getVarDeclSymbols() { return varDeclSymbols; }
+    public Map<ConstDecl, Symbol> getConstDeclSymbols() { return constDeclSymbols; }
+    public Map<AssignStmt, Symbol> getAssignSymbols() { return assignSymbols; }
     public SymbolTable getGlobalScope() { return globalScope; }
 
     // ========== Entry point ==========
@@ -88,12 +96,15 @@ public class SemanticAnalyzer {
         currentScope = funcScope;
 
         // Add parameters to function scope
+        List<Symbol> paramSymbols = new ArrayList<>();
         for (Param p : fd.params()) {
             Symbol paramSym = new Symbol(p.name(), Symbol.Kind.PARAM, Type.INT, false);
             if (!currentScope.define(paramSym)) {
                 error(p, "duplicate parameter name '" + p.name() + "'");
             }
+            paramSymbols.add(paramSym);
         }
+        funcParamSymbols.put(fd, paramSymbols);
 
         // Analyze body
         analyzeBlock(fd.body());
@@ -121,6 +132,7 @@ public class SemanticAnalyzer {
         if (!globalScope.define(sym)) {
             error(vd, "duplicate global name '" + vd.name() + "'");
         }
+        varDeclSymbols.put(vd, sym);
     }
 
     private void analyzeGlobalConstDecl(ConstDecl cd) {
@@ -135,6 +147,7 @@ public class SemanticAnalyzer {
         if (!globalScope.define(sym)) {
             error(cd, "duplicate global name '" + cd.name() + "'");
         }
+        constDeclSymbols.put(cd, sym);
     }
 
     // ========== Statements ==========
@@ -156,6 +169,8 @@ public class SemanticAnalyzer {
                     error(as_, "cannot assign to constant '" + as_.name() + "'");
                 } else if (sym.isFunc()) {
                     error(as_, "'" + as_.name() + "' is a function, not a variable");
+                } else {
+                    assignSymbols.put(as_, sym);
                 }
                 Type t = analyzeExpr(as_.value());
                 if (t != Type.INT) {
@@ -171,6 +186,7 @@ public class SemanticAnalyzer {
                 if (!currentScope.define(sym)) {
                     error(vd, "duplicate declaration of '" + vd.name() + "' in this scope");
                 }
+                varDeclSymbols.put(vd, sym);
             }
             case ConstDecl cd -> {
                 Integer value = evalConst(cd.initExpr());
@@ -183,6 +199,7 @@ public class SemanticAnalyzer {
                 if (!currentScope.define(sym)) {
                     error(cd, "duplicate declaration of '" + cd.name() + "' in this scope");
                 }
+                constDeclSymbols.put(cd, sym);
             }
             case IfStmt is -> {
                 Type condType = analyzeExpr(is.condition());

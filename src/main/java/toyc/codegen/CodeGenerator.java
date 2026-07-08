@@ -22,33 +22,10 @@ public class CodeGenerator {
     private int labelCounter;
     private final Deque<LoopLabels> loopStack;
 
-    // Registers for expression evaluation.
-    // Primary temp registers: t0-t6 (7 caller-saved).
+    // Registers for expression evaluation
     private static final String[] TEMP_REGS = {"t0", "t1", "t2", "t3", "t4", "t5", "t6"};
     private static final int NUM_TEMPS = 7;
     private final boolean[] tempUsed = new boolean[NUM_TEMPS];
-
-    // Overflow temp registers: a0-a7 (8 caller-saved). Only used when
-    // all t-registers are exhausted. Must be freed before function calls.
-    private static final String[] A_REGS = {"a0","a1","a2","a3","a4","a5","a6","a7"};
-    private static final int NUM_A_REGS = 8;
-    private final boolean[] aRegUsed = new boolean[NUM_A_REGS];
-
-    // S-registers available for persistent variable caching (callee-saved).
-    // s0 is already used as frame pointer; s1-s11 are free.
-    private static final String[] S_REGS = {
-        "s1","s2","s3","s4","s5","s6","s7","s8","s9","s10","s11"
-    };
-    private static final int NUM_S_REGS = 11;
-
-    // Variable-to-s-register mapping for the current function.
-    private final Map<String, String> varToSReg = new HashMap<>();
-    private final Map<String, String> sRegToVar = new HashMap<>();
-    private final Set<String> sRegDirty = new HashSet<>(); // s-regs needing writeback
-    // Which s-registers are actually used in the current function (for save/restore).
-    private final Set<String> usedSRegs = new LinkedHashSet<>();
-    // Stack offsets where s-regs are saved in frame (assigned during prologue).
-    private final Map<String, Integer> sRegSaveOffset = new HashMap<>();
 
     // Current function context
     private FuncDef currentFunc;
@@ -143,86 +120,17 @@ public class CodeGenerator {
         varDirty.clear();
         lastStoreReg.clear();
         regValid.clear();
-        varToSReg.clear();
-        sRegToVar.clear();
-        sRegDirty.clear();
-        usedSRegs.clear();
-        sRegSaveOffset.clear();
-        leakedSRegs.clear();
-        for (int i = 0; i < NUM_A_REGS; i++) aRegUsed[i] = false;
-
-        // Determine whether this is a leaf function (no calls in body)
-        boolean isLeaf = !stmtContainsCall(fd.body());
-        currentFuncIsLeaf = isLeaf;
-
-        Symbol funcSym = analyzer.getFuncSymbols().get(fd);
-
-        // ---- Variable-to-s-register assignment (optimization) ----
-        // Must happen BEFORE countLocals because s-reg saves affect
-        // the local offset starting point.
-        // For safety, only cache variables in leaf functions (no calls).
-        // Functions with calls have complex register interactions that
-        // require more thorough liveness analysis to cache safely.
-        // FIXME: s-reg caching temporarily disabled for debugging.
-        // Enable with: if (optimize) {
-        if (false) {
-            Map<String, Integer> varUseCounts = new HashMap<>();
-            countVarReads(fd.body(), varUseCounts);
-
-            // Also count parameters.
-            if (funcSym != null && funcSym.getFuncParamNames() != null) {
-                for (String pn : funcSym.getFuncParamNames()) {
-                    varUseCounts.putIfAbsent(pn, 0);
-                    varUseCounts.put(pn, varUseCounts.get(pn) + 1);
-                }
-            }
-
-            // Collect the set of names that exist in local scope
-            // (locals, params, or consts). Globals must NOT be cached
-            // in s-regs because they live in .data, not on the stack.
-            Set<String> localNames = new HashSet<>();
-            collectLocalNames(fd.body(), localNames);
-            if (funcSym != null && funcSym.getFuncParamNames() != null) {
-                localNames.addAll(funcSym.getFuncParamNames());
-            }
-
-            // Detect shadowed names: if a name is declared in more than one
-            // scope, skip it. Include parameters in the initial outer set
-            // so that local vars that shadow params are also detected.
-            Set<String> initialOuter = new HashSet<>();
-            if (funcSym != null && funcSym.getFuncParamNames() != null) {
-                initialOuter.addAll(funcSym.getFuncParamNames());
-            }
-            Set<String> shadowedNames = new HashSet<>();
-            findShadowedNames(fd.body(), initialOuter, shadowedNames);
-
-            List<String> sortedVars = varUseCounts.entrySet().stream()
-                .filter(e -> e.getValue() >= 2) // only cache if used 2+ times
-                .filter(e -> localNames.contains(e.getKey())) // exclude globals
-                .filter(e -> !shadowedNames.contains(e.getKey())) // exclude shadowed
-                .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
-                .map(Map.Entry::getKey)
-                .toList();
-
-            int sIdx = 0;
-            for (String varName : sortedVars) {
-                if (sIdx >= NUM_S_REGS) break;
-                String sReg = S_REGS[sIdx];
-                varToSReg.put(varName, sReg);
-                sRegToVar.put(sReg, varName);
-                usedSRegs.add(sReg);
-                sIdx++;
-            }
-        }
-
-        // s-reg saves go below ra/s0 save slots.
-        // nextLocalOffset must start past ra, s0, AND all s-reg saves.
-        int sRegSaveCount = usedSRegs.size();
-        nextLocalOffset = -8 - sRegSaveCount * 4;
+        nextLocalOffset = -8; // skip past saved ra (-4) and saved fp (-8)
 
         // Count locals declared in the body
         countLocals(fd.body());
 
+        // Determine whether this is a leaf function (no calls in body)
+        // and whether parameters can be kept in a0-a7 registers.
+        boolean isLeaf = !stmtContainsCall(fd.body());
+        currentFuncIsLeaf = isLeaf;
+
+        Symbol funcSym = analyzer.getFuncSymbols().get(fd);
         boolean leafParamsKeptInRegs = false;
         if (isLeaf && funcSym != null && funcSym.getFuncParamNames() != null) {
             leafParamsKeptInRegs = true;
@@ -242,39 +150,31 @@ public class CodeGenerator {
             }
         }
 
-        // Save the final offset for frame calculation.
+        // Save the final offset for frame calculation, then reset for code gen.
+        // countLocals and getLocalOffset above advance nextLocalOffset but pop
+        // block scopes, so genStmt must restart from -8 to produce matching offsets.
         int finalLocalOffset = nextLocalOffset;
 
         // Reserve spill slots for expression evaluation.
+        // calcMaxSpillDepth covers binary-expr and per-call spills.
+        // Add headroom for nested-call scenarios where outer genCall
+        // pre-spills coexist with inner genCall arg-eval spills.
         int maxSpillDepth = calcMaxSpillDepth(fd.body());
         if (!isLeaf) {
-            // Nested calls can cause cascading spills in genCall's arg loop.
-            maxSpillDepth += 12;
+            maxSpillDepth += 12; // safety margin for nested-call overlaps
         }
         int spillAreaSize = maxSpillDepth * 4;
 
-        boolean hasLocalsOrParams = finalLocalOffset < -(8 + sRegSaveCount * 4);
-        boolean needsFrame = hasLocalsOrParams || maxSpillDepth > 0 || sRegSaveCount > 0;
+        boolean hasLocalsOrParams = finalLocalOffset < -8;
+        boolean needsFrame = hasLocalsOrParams || maxSpillDepth > 0;
 
-        // Calculate frame size — include space for saved s-registers.
-        int savedRegsSize = (needsFrame || !isLeaf) ? 8 : 0; // ra + s0
-        int sRegSaveSize = sRegSaveCount * 4;
+        // Calculate frame size.
+        int savedRegsSize = (needsFrame || !isLeaf) ? 8 : 0;
 
-        int baseOffset = 8 + sRegSaveSize;
-        int localSize = -finalLocalOffset - baseOffset;
+        int localSize = -finalLocalOffset - 8;
         if (localSize < 0) localSize = 0;
-        frameSize = savedRegsSize + sRegSaveSize + localSize + spillAreaSize;
+        frameSize = savedRegsSize + localSize + spillAreaSize;
         frameSize = (frameSize + 15) & ~15; // 16-byte aligned
-
-        // Assign save slots for s-registers in the frame.
-        // Layout (high to low): ra, s0, s1, s2, ..., locals, spills
-        {
-            int sOffset = frameSize - 8 - 4; // start below s0 save slot
-            for (String sr : usedSRegs) {
-                sRegSaveOffset.put(sr, sOffset);
-                sOffset -= 4;
-            }
-        }
 
         // Emit function label
         emit("");
@@ -287,17 +187,13 @@ public class CodeGenerator {
                 emit("sw", "ra", (frameSize - 4) + "(sp)");
             }
             emit("sw", "s0", (frameSize - 8) + "(sp)");
-            // Save used s-registers
-            for (String sr : usedSRegs) {
-                int off = sRegSaveOffset.get(sr);
-                emit("sw", sr, off + "(sp)");
-            }
             emit("addi", "s0", "sp", String.valueOf(frameSize));
         }
 
         // Reset local offset state for code generation.
-        // Start past ra(-4), s0(-8), and s-reg saves.
-        nextLocalOffset = -8 - sRegSaveCount * 4;
+        // countLocals already consumed offset space; genStmt must replay
+        // the same allocations starting from -8 so offsets match the frame.
+        nextLocalOffset = -8;
         localOffsetStack.clear();
         localOffsetStack.push(new HashMap<>()); // function scope
 
@@ -313,43 +209,14 @@ public class CodeGenerator {
         nextSpillOffset = finalLocalOffset - 4;
 
         // Store parameters into local slots.
-        // Also initialize s-register values for params assigned to s-regs.
         if (!leafParamsKeptInRegs && funcSym != null
                 && funcSym.getFuncParamNames() != null && frameSize > 0) {
             int argReg = 0;
             for (String paramName : funcSym.getFuncParamNames()) {
                 if (argReg < 8) {
-                    String aReg = "a" + argReg;
+                    String reg = "a" + argReg;
                     int offset = getLocalOffset(paramName);
-                    emit("sw", aReg, offset + "(s0)");
-                    // If this param is cached in an s-reg, load it now.
-                    String sReg = varToSReg.get(paramName);
-                    if (sReg != null) {
-                        emit("mv", sReg, aReg);
-                        sRegDirty.add(sReg);
-                    }
-                }
-                argReg++;
-            }
-        }
-
-        // Even when leafParamsKeptInRegs is true, we must still initialize
-        // s-registers for parameters that were assigned to s-regs.
-        // (The s-reg cache takes priority over the a-reg/stack in genId.)
-        if (leafParamsKeptInRegs && optimize && funcSym != null
-                && funcSym.getFuncParamNames() != null) {
-            int argReg = 0;
-            for (String paramName : funcSym.getFuncParamNames()) {
-                String sReg = varToSReg.get(paramName);
-                if (sReg != null) {
-                    if (argReg < 8) {
-                        emit("mv", sReg, "a" + argReg);
-                    } else if (frameSize > 0) {
-                        // Extra param arrives on caller's outgoing arg area.
-                        int callerOff = frameSize + (argReg - 8) * 4;
-                        emit("lw", sReg, callerOff + "(sp)");
-                    }
-                    sRegDirty.add(sReg);
+                    emit("sw", reg, offset + "(s0)");
                 }
                 argReg++;
             }
@@ -358,15 +225,9 @@ public class CodeGenerator {
         // Generate body
         genStmt(fd.body());
 
-        // Epilogue — write back dirty s-regs before exit.
+        // Epilogue
         emitLabel(funcEpilogueLabel());
-        flushAllSRegDirty();
         if (frameSize > 0) {
-            // Restore s-registers
-            for (String sr : usedSRegs) {
-                int off = sRegSaveOffset.get(sr);
-                emit("lw", sr, off + "(sp)");
-            }
             if (!isLeaf) {
                 emit("lw", "ra", (frameSize - 4) + "(sp)");
             }
@@ -376,120 +237,6 @@ public class CodeGenerator {
         emit("ret");
 
         currentFunc = null;
-    }
-
-    /** Find names declared in more than one (nested) scope. */
-    private void findShadowedNames(Stmt stmt, Set<String> outerNames,
-                                   Set<String> shadowed) {
-        switch (stmt) {
-            case Block b -> {
-                Set<String> blockNames = new HashSet<>();
-                collectBlockDeclNames(b, blockNames);
-                for (String n : blockNames) {
-                    if (outerNames.contains(n)) shadowed.add(n);
-                }
-                Set<String> combined = new HashSet<>(outerNames);
-                combined.addAll(blockNames);
-                for (Stmt s : b.stmts()) {
-                    findShadowedNames(s, combined, shadowed);
-                }
-            }
-            case IfStmt is -> {
-                findShadowedNames(is.thenStmt(), outerNames, shadowed);
-                if (is.elseStmt() != null)
-                    findShadowedNames(is.elseStmt(), outerNames, shadowed);
-            }
-            case WhileStmt ws ->
-                findShadowedNames(ws.body(), outerNames, shadowed);
-            default -> {}
-        }
-    }
-
-    private void collectBlockDeclNames(Stmt stmt, Set<String> names) {
-        switch (stmt) {
-            case Block b -> {
-                for (Stmt s : b.stmts()) collectBlockDeclNames(s, names);
-            }
-            case VarDecl vd -> names.add(vd.name());
-            case ConstDecl cd -> names.add(cd.name());
-            default -> {}
-        }
-    }
-
-    /** Collect names declared locally in a statement subtree. */
-    private void collectLocalNames(Stmt stmt, Set<String> names) {
-        switch (stmt) {
-            case Block b -> {
-                for (Stmt s : b.stmts()) collectLocalNames(s, names);
-            }
-            case VarDecl vd -> names.add(vd.name());
-            case ConstDecl cd -> names.add(cd.name());
-            case IfStmt is -> {
-                collectLocalNames(is.thenStmt(), names);
-                if (is.elseStmt() != null) collectLocalNames(is.elseStmt(), names);
-            }
-            case WhileStmt ws -> collectLocalNames(ws.body(), names);
-            default -> {}
-        }
-    }
-
-    /** Count variable reads in a statement subtree. */
-    private void countVarReads(Stmt stmt, Map<String, Integer> counts) {
-        switch (stmt) {
-            case Block b -> {
-                for (Stmt s : b.stmts()) countVarReads(s, counts);
-            }
-            case ExprStmt es -> countExprReads(es.expr(), counts);
-            case AssignStmt as_ -> {
-                countExprReads(as_.value(), counts);
-                // Don't count the assign target as a "read"
-            }
-            case VarDecl vd -> countExprReads(vd.initExpr(), counts);
-            case ConstDecl cd -> countExprReads(cd.initExpr(), counts);
-            case IfStmt is -> {
-                countExprReads(is.condition(), counts);
-                countVarReads(is.thenStmt(), counts);
-                if (is.elseStmt() != null) countVarReads(is.elseStmt(), counts);
-            }
-            case WhileStmt ws -> {
-                countExprReads(ws.condition(), counts);
-                countVarReads(ws.body(), counts);
-            }
-            case ReturnStmt rs -> {
-                if (rs.value() != null) countExprReads(rs.value(), counts);
-            }
-            default -> {}
-        }
-    }
-
-    /** Count variable reads in an expression. */
-    private void countExprReads(Expr expr, Map<String, Integer> counts) {
-        switch (expr) {
-            case IdExpr id -> counts.merge(id.name(), 1, Integer::sum);
-            case BinaryExpr be -> {
-                countExprReads(be.left(), counts);
-                countExprReads(be.right(), counts);
-            }
-            case UnaryExpr ue -> countExprReads(ue.operand(), counts);
-            case CallExpr ce -> {
-                for (Expr arg : ce.args()) countExprReads(arg, counts);
-            }
-            default -> {}
-        }
-    }
-
-    /** Write back all dirty s-register variables to their stack slots. */
-    private void flushAllSRegDirty() {
-        if (!optimize) return;
-        for (String varName : new ArrayList<>(sRegDirty)) {
-            String sReg = varToSReg.get(varName);
-            if (sReg == null) continue;
-            Integer off = lookupLocalOffset(varName);
-            if (off != null) {
-                emit("sw", sReg, off + "(s0)");
-            }
-        }
-        sRegDirty.clear();
     }
 
     private String funcEpilogueLabel() {
@@ -583,9 +330,8 @@ public class CodeGenerator {
                     maxD = Math.max(maxD, calcMaxExprDepth(arg));
                 }
                 // genCall may spill previously-evaluated register args
-                // before evaluating call-containing args. Worst case:
-                // all register args (up to 8) spilled PLUS max arg depth
-                // for nested call evaluations. Use sum to be conservative.
+                // before evaluating call-containing args. Conservative
+                // upper bound: all register args spilled at once.
                 int callSpills = Math.min(ce.args().size(), 8);
                 yield maxD + callSpills;
             }
@@ -745,13 +491,7 @@ public class CodeGenerator {
                 // Check local scope first (handles shadowing of globals)
                 Integer localOff = lookupLocalOffset(as_.name());
                 if (localOff != null) {
-                    // S-register caching: update the s-register value too.
                     if (optimize) {
-                        String sReg = varToSReg.get(as_.name());
-                        if (sReg != null) {
-                            emit("mv", sReg, r);
-                            sRegDirty.add(sReg);
-                        }
                         // Keep variable in its existing cached register if any
                         String cachedReg = getCachedReg(as_.name());
                         if (cachedReg != null && !cachedReg.equals(r)) {
@@ -775,11 +515,6 @@ public class CodeGenerator {
                         // Parameter or other local not yet allocated
                         int offset = getLocalOffset(as_.name());
                         if (optimize) {
-                            String sReg = varToSReg.get(as_.name());
-                            if (sReg != null) {
-                                emit("mv", sReg, r);
-                                sRegDirty.add(sReg);
-                            }
                             String cachedReg = getCachedReg(as_.name());
                             if (cachedReg != null && !cachedReg.equals(r)) {
                                 emit("mv", cachedReg, r);
@@ -811,17 +546,9 @@ public class CodeGenerator {
                 }
                 String r = genExpr(vd.initExpr());
                 int offset = allocateLocal(vd.name());
-                // S-register caching for the new variable.
-                if (optimize) {
-                    String sReg = varToSReg.get(vd.name());
-                    if (sReg != null) {
-                        emit("mv", sReg, r);
-                        sRegDirty.add(sReg);
-                    }
-                    if (enableRegCache) {
-                        cacheVar(vd.name(), r);
-                        varDirty.remove(vd.name());
-                    }
+                if (optimize && enableRegCache) {
+                    cacheVar(vd.name(), r);
+                    varDirty.remove(vd.name()); // stored below
                 }
                 emit("sw", r, offset + "(s0)");
                 if (optimize) {
@@ -842,14 +569,6 @@ public class CodeGenerator {
                 }
                 String r = genExpr(cd.initExpr());
                 int offset = allocateLocal(cd.name());
-                // S-register caching for the new constant.
-                if (optimize) {
-                    String sReg = varToSReg.get(cd.name());
-                    if (sReg != null) {
-                        emit("mv", sReg, r);
-                        sRegDirty.add(sReg);
-                    }
-                }
                 emit("sw", r, offset + "(s0)");
                 if (optimize) {
                     lastStoreReg.put(cd.name(), r);
@@ -919,7 +638,6 @@ public class CodeGenerator {
 
     private void genReturn(ReturnStmt rs) {
         flushAllDirty();
-        flushAllSRegDirty();
         if (rs.value() != null) {
             String r = genExpr(rs.value());
             emit("mv", "a0", r); // return value in a0
@@ -964,18 +682,6 @@ public class CodeGenerator {
             return r;
         }
 
-        // S-register variable cache: if this variable lives in an s-register,
-        // just copy its value to a temp register (or alloc it directly).
-        if (optimize) {
-            String sReg = varToSReg.get(id.name());
-            if (sReg != null) {
-                // Variable is cached in an s-register — no lw needed.
-                String r = allocReg();
-                emit("mv", r, sReg);
-                return r;
-            }
-        }
-
         // Last-store optimization: if variable was just stored and its
         // register hasn't been reused, use it directly (avoid lw).
         if (optimize) {
@@ -999,6 +705,7 @@ public class CodeGenerator {
                 && lookupLocalOffset(id.name()) == null) {
             // Leaf function: parameter kept in its original a-register
             // (not assigned to, not stored to stack).
+            // Find which parameter index this is.
             Symbol funcSym = analyzer.getFuncSymbols().get(currentFunc);
             int paramIdx = -1;
             if (funcSym != null && funcSym.getFuncParamNames() != null) {
@@ -1006,13 +713,6 @@ public class CodeGenerator {
             }
             if (paramIdx >= 0 && paramIdx < 8) {
                 emit("mv", r, "a" + paramIdx);
-            } else if (paramIdx >= 8 && frameSize > 0) {
-                // Parameter 8+ arrives on the caller's outgoing arg area.
-                // The caller stored extra args at old_sp + (i-8)*4.
-                // After our prologue (addi sp,sp,-frameSize),
-                // those are at sp + frameSize + (i-8)*4.
-                int callerOffset = frameSize + (paramIdx - 8) * 4;
-                emit("lw", r, callerOffset + "(sp)");
             } else {
                 emit("li", r, "0"); // fallback (should not happen)
             }
@@ -1045,10 +745,12 @@ public class CodeGenerator {
         String leftReg = genExpr(be.left());
 
         // Only spill left if the right operand contains a function call
+        // (which may clobber caller-saved temp registers t0-t6).
         String rightReg;
         String resultReg;
 
         if (exprContainsCall(be.right())) {
+            // Right operand contains a call — spill left to frame.
             int spillOffset = allocateSpillSlot();
             spillReg(leftReg, spillOffset);
             freeReg(leftReg);
@@ -1057,96 +759,50 @@ public class CodeGenerator {
             resultReg = loadSpill(spillOffset);
             freeSpillSlot(spillOffset);
         } else {
+            // Right operand has no calls — reuse leftReg as result to avoid mv.
             rightReg = genExpr(be.right());
             resultReg = leftReg;
+            // Don't free leftReg — it's now resultReg
         }
 
-        // Safe algebraic optimizations (post-evaluation).
-        // Right-side literal identities:
+        // Strength reduction: use immediate instructions when possible
         if (optimize && be.right() instanceof LiteralExpr rle) {
             int imm = rle.value();
-            boolean handled = false;
-            switch (be.op()) {
-                case "+" -> { if (imm == 0) handled = true; }
-                case "-" -> { if (imm == 0) handled = true; }
-                case "*" -> {
-                    if (imm == 0) {
-                        emit("mv", resultReg, "zero");
-                        handled = true;
-                    } else if (imm == 1) {
-                        handled = true;
-                    } else if ((imm & (imm - 1)) == 0 && imm > 0) {
-                        int shift = Integer.numberOfTrailingZeros(imm);
-                        emit("slli", resultReg, resultReg, String.valueOf(shift));
-                        handled = true;
-                    }
-                }
-                case "/" -> { if (imm == 1) handled = true; }
-                case "%" -> { if (imm == 1) { emit("mv", resultReg, "zero"); handled = true; } }
-            }
-            if (handled) { freeReg(rightReg); return resultReg; }
             if (tryEmitImmOp(be.op(), resultReg, resultReg, imm)) {
-                freeReg(rightReg); return resultReg;
+                freeReg(rightReg);
+                return resultReg;
             }
-        }
-        // Left-side literal commutative identities:
-        if (optimize && be.left() instanceof LiteralExpr lle) {
-            int imm = lle.value();
-            boolean handled = false;
-            switch (be.op()) {
-                case "+" -> { if (imm == 0) { freeReg(resultReg); return rightReg; } }
-                case "*" -> {
-                    if (imm == 0) {
-                        emit("mv", resultReg, "zero");
-                        handled = true;
-                    } else if (imm == 1) {
-                        freeReg(resultReg); return rightReg;
-                    }
-                }
-                case "-" -> {
-                    if (imm == 0) {
-                        emit("sub", resultReg, "zero", rightReg);
-                        handled = true;
-                    }
-                }
-            }
-            if (handled) { freeReg(rightReg); return resultReg; }
         }
 
         // resultReg holds left value; apply operator with rightReg
-        emitBinaryOp(be.op(), resultReg, resultReg, rightReg);
-        freeReg(rightReg);
-        return resultReg;
-    }
-
-    /** Emit a binary operation with two register operands. */
-    private void emitBinaryOp(String op, String rd, String rs1, String rs2) {
-        switch (op) {
-            case "+" -> emit("add", rd, rs1, rs2);
-            case "-" -> emit("sub", rd, rs1, rs2);
-            case "*" -> emit("mul", rd, rs1, rs2);
-            case "/" -> emit("div", rd, rs1, rs2);
-            case "%" -> emit("rem", rd, rs1, rs2);
+        switch (be.op()) {
+            case "+" -> emit("add", resultReg, resultReg, rightReg);
+            case "-" -> emit("sub", resultReg, resultReg, rightReg);
+            case "*" -> emit("mul", resultReg, resultReg, rightReg);
+            case "/" -> emit("div", resultReg, resultReg, rightReg);
+            case "%" -> emit("rem", resultReg, resultReg, rightReg);
             case "==" -> {
-                emit("sub", rd, rs1, rs2);
-                emit("seqz", rd, rd);
+                emit("sub", resultReg, resultReg, rightReg);
+                emit("seqz", resultReg, resultReg);
             }
             case "!=" -> {
-                emit("sub", rd, rs1, rs2);
-                emit("snez", rd, rd);
+                emit("sub", resultReg, resultReg, rightReg);
+                emit("snez", resultReg, resultReg);
             }
-            case "<"  -> emit("slt", rd, rs1, rs2);
+            case "<"  -> emit("slt", resultReg, resultReg, rightReg);
             case ">=" -> {
-                emit("slt", rd, rs1, rs2);
-                emit("xori", rd, rd, "1");
+                emit("slt", resultReg, resultReg, rightReg);
+                emit("xori", resultReg, resultReg, "1");
             }
-            case ">"  -> emit("slt", rd, rs2, rs1);
+            case ">"  -> emit("slt", resultReg, rightReg, resultReg);
             case "<=" -> {
-                emit("slt", rd, rs2, rs1);
-                emit("xori", rd, rd, "1");
+                emit("slt", resultReg, rightReg, resultReg);
+                emit("xori", resultReg, resultReg, "1");
             }
-            default -> emit("add", rd, rs1, rs2);
+            default -> emit("add", resultReg, resultReg, rightReg);
         }
+        freeReg(rightReg);
+        return resultReg;
     }
 
     /** Try to evaluate a binary expression at compile time. */
@@ -1207,23 +863,14 @@ public class CodeGenerator {
                 return true;
             }
             case ">" -> {
-                // rs > imm  ≡  imm < rs  ≡  slti rd, rs, imm+1  ...
-                // Actually: a > b  ≡  b < a. For constant b:
-                // rs > imm  ≡  imm < rs  ≡  imm+1 <= rs  ≡  slti rd, rs, imm+1 then xori
-                // Simpler: rs > imm  ≡  rs >= imm+1  ≡  NOT(rs < imm+1)  ≡  slti rd,rs,imm+1; xori rd,rd,1
                 if (imm < 2047) {
                     emit("slti", rd, rs, String.valueOf(imm + 1));
                     emit("xori", rd, rd, "1");
                     return true;
                 }
-                // imm == 2047: rs > 2047  ≡  rs >= 2048 (out of 12-bit range) → fall back
                 return false;
             }
             case "<=" -> {
-                // rs <= imm  ≡  NOT(imm < rs)  ≡  NOT(rs > imm)  ≡  slti rd,rs,imm+1 but inverted...
-                // a <= b  ≡  NOT(b < a). For constant: rs <= imm  ≡  NOT(imm < rs)
-                // slt rd, zero, rs  → if rs > 0 then 1... hmm.
-                // Better: rs <= imm  ≡  rs < imm+1  ≡  slti rd, rs, imm+1
                 if (imm < 2047) {
                     emit("slti", rd, rs, String.valueOf(imm + 1));
                     return true;
@@ -1373,13 +1020,6 @@ public class CodeGenerator {
     }
 
     private String genCall(CallExpr ce) {
-        // Before a call: flush s-register dirty bits to stack for safety
-        // (callee-saved s-regs survive the call, but we want the stack
-        // to reflect the latest values in case of recursion etc.).
-        if (optimize) {
-            flushAllSRegDirty();
-        }
-
         // Before a call, clear last-store tracking since caller-saved regs
         // (t0-t6, a0-a7) will be clobbered. Must also free the underlying
         // temp registers, otherwise they stay marked as "used" forever.
@@ -1390,10 +1030,6 @@ public class CodeGenerator {
             invalidateRegCache();
             lastStoreReg.clear();
             regValid.clear();
-            // Also free all a-register temps (they're clobbered by the call).
-            for (int i = 0; i < NUM_A_REGS; i++) {
-                aRegUsed[i] = false;
-            }
         }
 
         int numArgs = ce.args().size();
@@ -1471,12 +1107,8 @@ public class CodeGenerator {
             }
         }
 
-        // Move non-spilled register args from temp regs to a-regs.
-        // Process in REVERSE order: if a higher-index arg uses an
-        // a-reg as its source (e.g., argRegs[5]="a3"), that a-reg
-        // must be read before a lower-index move overwrites it
-        // (e.g., "mv a3, tX" at i=3).
-        for (int i = regArgCount - 1; i >= 0; i--) {
+        // Move non-spilled register args from temp regs to a-regs
+        for (int i = 0; i < regArgCount; i++) {
             if (argRegs[i] != null) {
                 emit("mv", "a" + i, argRegs[i]);
                 freeReg(argRegs[i]);
@@ -1485,9 +1117,16 @@ public class CodeGenerator {
         }
         // At this point all temp registers should be free.
 
-        // Store extra args (beyond 8) into the outgoing-arg area.
-        // Interleave loading spilled values and storing to avoid
-        // register exhaustion when there are many spilled extra args.
+        // Load back spilled extra args (plenty of free regs now)
+        for (int i = 8; i < numArgs; i++) {
+            if (argSpills[i] != -1) {
+                argRegs[i] = loadSpill(argSpills[i]);
+                freeSpillSlot(argSpills[i]);
+                argSpills[i] = -1;
+            }
+        }
+
+        // Set up outgoing-arg area on stack for args beyond 8
         int extraAlignedSize = 0;
         if (extraArgs > 0) {
             int extraSize = extraArgs * 4;
@@ -1495,23 +1134,12 @@ public class CodeGenerator {
             emit("addi", "sp", "sp", String.valueOf(-extraAlignedSize));
 
             for (int i = 8; i < numArgs; i++) {
-                String reg;
                 if (argRegs[i] != null) {
-                    // Already in a temp register.
-                    reg = argRegs[i];
-                } else if (argSpills[i] != -1) {
-                    // Value was spilled — load it now.
-                    reg = allocReg();
-                    emit("lw", reg, argSpills[i] + "(s0)");
-                    freeSpillSlot(argSpills[i]);
-                    argSpills[i] = -1;
-                } else {
-                    continue;
+                    int offset = (i - 8) * 4;
+                    emit("sw", argRegs[i], offset + "(sp)");
+                    freeReg(argRegs[i]);
+                    argRegs[i] = null;
                 }
-                int offset = (i - 8) * 4;
-                emit("sw", reg, offset + "(sp)");
-                freeReg(reg);
-                argRegs[i] = null;
             }
         }
 
@@ -1534,9 +1162,6 @@ public class CodeGenerator {
         int count = 0;
         for (int i = 0; i < NUM_TEMPS; i++) {
             if (!tempUsed[i]) count++;
-        }
-        for (int i = 0; i < NUM_A_REGS; i++) {
-            if (!aRegUsed[i]) count++;
         }
         return count;
     }
@@ -1602,17 +1227,20 @@ public class CodeGenerator {
         for (int i = 0; i < NUM_TEMPS; i++) {
             if (!tempUsed[i]) {
                 tempUsed[i] = true;
+                // This register is being reused — any last-store value is gone
                 regValid.remove(TEMP_REGS[i]);
                 return TEMP_REGS[i];
             }
         }
         // All temp registers are in use. Try to steal one from the
         // last-store cache (optimization). These registers hold values
-        // already stored to memory, so stealing them is safe.
+        // already stored to memory, so stealing them is safe — the
+        // next read will just use lw instead.
         if (optimize) {
             for (int i = 0; i < NUM_TEMPS; i++) {
                 String reg = TEMP_REGS[i];
                 if (regValid.contains(reg)) {
+                    // Find which variable this register was cached for
                     String varName = null;
                     for (var e : lastStoreReg.entrySet()) {
                         if (e.getValue().equals(reg)) {
@@ -1646,54 +1274,9 @@ public class CodeGenerator {
                 invalidateVar(varName);
                 return allocReg();
             }
-
-            // Last resort: spill a dirty s-reg variable to stack.
-            // Write back to its local slot, then remove from cache
-            // so its s-reg can be reused as a temp.
-            if (!sRegDirty.isEmpty()) {
-                String varName = sRegDirty.iterator().next();
-                String sReg = varToSReg.get(varName);
-                if (sReg != null) {
-                    Integer off = lookupLocalOffset(varName);
-                    if (off != null) {
-                        emit("sw", sReg, off + "(s0)");
-                    }
-                    sRegDirty.remove(varName);
-                    varToSReg.remove(varName);
-                    sRegToVar.remove(sReg);
-                    // Reuse this s-reg as a temp. Mark it as "in use"
-                    // by treating it like an allocated register. The
-                    // caller must free it via freeReg, which will
-                    // no-op for s-regs. This is a one-shot use:
-                    // after freeReg no-ops, future allocReg calls
-                    // won't find this s-reg (it's no longer in
-                    // varToSReg or tempUsed). To avoid leaking it,
-                    // we add it back to the free pool via a special
-                    // tracking set.
-                    leakedSRegs.add(sReg);
-                    return sReg;
-                }
-            }
-            // Reuse a previously-leaked s-reg if available.
-            if (!leakedSRegs.isEmpty()) {
-                String sReg = leakedSRegs.iterator().next();
-                leakedSRegs.remove(sReg);
-                return sReg;
-            }
-        }
-        // All t-reg fallbacks exhausted. Use a0-a7 as overflow temp regs.
-        for (int i = 0; i < NUM_A_REGS; i++) {
-            if (!aRegUsed[i]) {
-                aRegUsed[i] = true;
-                return A_REGS[i];
-            }
         }
         throw new RuntimeException("out of temporary registers");
     }
-
-    // Track s-registers that were evicted from var-cache and used as temps.
-    // They can be reused by future allocReg calls when t-regs are exhausted.
-    private final Set<String> leakedSRegs = new HashSet<>();
 
     /** Get the index of a temp register (0-6). */
     private int regIndex(String reg) {
@@ -1711,27 +1294,12 @@ public class CodeGenerator {
     }
 
     private void freeReg(String reg) {
-        // s-registers: if this was a leaked/stolen s-reg, recycle it.
-        if (reg.startsWith("s")) {
-            if (optimize) {
-                leakedSRegs.add(reg);
-            }
-            return;
-        }
-        // a-registers (overflow temps)
-        if (reg.startsWith("a")) {
-            for (int i = 0; i < NUM_A_REGS; i++) {
-                if (A_REGS[i].equals(reg)) {
-                    aRegUsed[i] = false;
-                    return;
-                }
-            }
-            return;
-        }
         for (int i = 0; i < NUM_TEMPS; i++) {
             if (TEMP_REGS[i].equals(reg)) {
                 tempUsed[i] = false;
+                // This register is being freed — any last-store value is gone
                 regValid.remove(reg);
+                // If this register was cached for a variable, invalidate
                 if (optimize) {
                     String var = regToVar.remove(reg);
                     if (var != null) {
@@ -1746,16 +1314,6 @@ public class CodeGenerator {
 
     /** Free a temp register without touching the cache. */
     private void freeRegRaw(String reg) {
-        if (reg.startsWith("s")) return;
-        if (reg.startsWith("a")) {
-            for (int i = 0; i < NUM_A_REGS; i++) {
-                if (A_REGS[i].equals(reg)) {
-                    aRegUsed[i] = false;
-                    return;
-                }
-            }
-            return;
-        }
         for (int i = 0; i < NUM_TEMPS; i++) {
             if (TEMP_REGS[i].equals(reg)) {
                 tempUsed[i] = false;

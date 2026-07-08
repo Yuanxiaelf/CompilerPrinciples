@@ -13,8 +13,8 @@ public class CodeGenerator {
 
     private final SemanticAnalyzer analyzer;
     private final boolean optimize;
-    private static final int INTERPRETER_FUEL = 60_000_000;
-    private static final long INTERPRETER_TIME_NS = 2_000_000_000L;
+    private static final int INTERPRETER_FUEL = 8_000_000;
+    private static final long INTERPRETER_TIME_NS = 200_000_000L;
     private static final int INTERPRETER_MAX_AST_NODES = 200_000;
     // Register cache DISABLED: stable-register approach causes correctness
     // bugs (wrong output on p01-p05, timeouts on p06-p12). Requires proper
@@ -37,6 +37,7 @@ public class CodeGenerator {
     private static final String[] SAVED_VALUE_REGS = {
             "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"
     };
+    private final Map<String, FuncDef> functionsByName = new HashMap<>();
 
     // Current function context
     private FuncDef currentFunc;
@@ -52,6 +53,8 @@ public class CodeGenerator {
 
     // Function-local symbols assigned to callee-saved registers.
     private final Map<Symbol, String> symbolRegs = new IdentityHashMap<>();
+    // Hot global variables whose addresses are kept in callee-saved registers.
+    private final Map<Symbol, String> globalAddrRegs = new IdentityHashMap<>();
 
     // Register cache for local variables (optimization)
     // Simple "last store" tracking: maps variable name → register from most
@@ -69,6 +72,7 @@ public class CodeGenerator {
 
     // Loop labels
     private record LoopLabels(String start, String end) {}
+    private record BranchOperand(String reg, boolean owned) {}
 
     public CodeGenerator(SemanticAnalyzer analyzer, boolean optimize) {
         this.analyzer = analyzer;
@@ -81,6 +85,13 @@ public class CodeGenerator {
     // ========== Entry point ==========
 
     public String generate(CompUnit compUnit) {
+        functionsByName.clear();
+        for (ASTNode item : compUnit.items()) {
+            if (item instanceof FuncDef fd) {
+                functionsByName.put(fd.name(), fd);
+            }
+        }
+
         if (optimize) {
             Integer foldedMain = tryEvaluateMain(compUnit);
             if (foldedMain != null) {
@@ -478,10 +489,12 @@ public class CodeGenerator {
             IdentityHashMap<Symbol, Poly> env = new IdentityHashMap<>();
             List<LoopUpdate> updates = new ArrayList<>();
             IdentityHashMap<Symbol, Poly> finalAssignments = new IdentityHashMap<>();
+            Set<Symbol> cumulativeUpdates = newIdentitySet();
             boolean sawStep = false;
 
             for (Stmt stmt : info.stmts) {
                 if (stmt instanceof VarDecl vd) {
+                    if (exprUsesAnySymbol(vd.initExpr(), cumulativeUpdates, null)) return false;
                     Symbol target = analyzer.getVarDeclSymbols().get(vd);
                     Poly value = evalPolyWithEnv(vd.initExpr(), info.loopSym, frame, env);
                     if (target == null || value == null) return false;
@@ -502,6 +515,7 @@ public class CodeGenerator {
                     }
 
                     if (env.containsKey(target)) {
+                        if (exprUsesAnySymbol(as_.value(), cumulativeUpdates, null)) return false;
                         Poly value = evalPolyWithEnv(as_.value(), info.loopSym, frame, env);
                         if (value == null) return false;
                         env.put(target, value);
@@ -511,8 +525,13 @@ public class CodeGenerator {
 
                     Poly delta = extractSelfPolyDeltaWithEnv(as_.value(), target, info.loopSym, frame, env);
                     if (delta != null) {
+                        if (exprUsesAnySymbol(as_.value(), cumulativeUpdates, target)) return false;
                         updates.add(new LoopUpdate(target, delta.constant, delta.linear, delta.quadratic));
+                        cumulativeUpdates.add(target);
                     } else {
+                        if (cumulativeUpdates.contains(target)) return false;
+                        if (exprUsesSymbol(as_.value(), target)) return false;
+                        if (exprUsesAnySymbol(as_.value(), cumulativeUpdates, null)) return false;
                         Poly value = evalPolyWithEnv(as_.value(), info.loopSym, frame, env);
                         if (value == null) return false;
                         env.put(target, value);
@@ -699,15 +718,19 @@ public class CodeGenerator {
             if (iterations == 0) return true;
 
             List<BulkLoopStmt> bulkStmts = new ArrayList<>();
+            Set<Symbol> cumulativeUpdates = newIdentitySet();
             for (Stmt stmt : stmts) {
                 if (stmt instanceof AssignStmt as_) {
                     Symbol target = analyzer.getAssignSymbols().get(as_);
                     if (target == loopSym) continue;
+                    if (exprUsesAnySymbol(as_.value(), cumulativeUpdates, target)) return false;
                     LoopUpdate update = parseLoopUpdate(as_, target, loopSym, frame);
                     if (update == null) return false;
                     bulkStmts.add(new BulkUpdates(List.of(update)));
+                    cumulativeUpdates.add(target);
                 } else if (stmt instanceof IfStmt is) {
-                    BulkModuloCond bulkCond = parseModuloCondition(is.condition(), loopSym);
+                    if (exprUsesAnySymbol(is.condition(), cumulativeUpdates, null)) return false;
+                    BulkCond bulkCond = parseBulkCondition(is.condition(), loopSym, frame);
                     if (bulkCond == null) return false;
                     List<LoopUpdate> thenUpdates = parseBranchUpdates(is.thenStmt(), loopSym, frame);
                     if (thenUpdates == null) return false;
@@ -727,7 +750,7 @@ public class CodeGenerator {
                 if (bulkStmt instanceof BulkUpdates updates) {
                     applyBulkUpdates(updates.updates, iterations, totalSumI, totalSumI2, frame);
                 } else if (bulkStmt instanceof BulkIf bulkIf) {
-                    CountAndSum truePart = countModuloMatches(start, step, iterations, bulkIf.cond);
+                    CountAndSum truePart = countMatches(start, step, iterations, bulkIf.cond);
                     long falseCount = iterations - truePart.count;
                     long falseSum = totalSumI - truePart.sum;
                     // Modulo branch fast path currently supports affine updates only.
@@ -767,15 +790,24 @@ public class CodeGenerator {
             else branchStmts = List.of(stmt);
 
             List<LoopUpdate> updates = new ArrayList<>();
+            Set<Symbol> cumulativeUpdates = newIdentitySet();
             for (Stmt s : branchStmts) {
                 if (!(s instanceof AssignStmt as_)) return null;
                 Symbol target = analyzer.getAssignSymbols().get(as_);
                 if (target == null || target == loopSym) return null;
+                if (exprUsesAnySymbol(as_.value(), cumulativeUpdates, target)) return null;
                 LoopUpdate update = parseLoopUpdate(as_, target, loopSym, frame);
                 if (update == null) return null;
                 updates.add(update);
+                cumulativeUpdates.add(target);
             }
             return updates;
+        }
+
+        private BulkCond parseBulkCondition(Expr expr, Symbol loopSym, EvalFrame frame) {
+            BulkModuloCond modCond = parseModuloCondition(expr, loopSym);
+            if (modCond != null) return modCond;
+            return parseRelCondition(expr, loopSym, frame);
         }
 
         private BulkModuloCond parseModuloCondition(Expr expr, Symbol loopSym) {
@@ -794,6 +826,24 @@ public class CodeGenerator {
             return null;
         }
 
+        private BulkRelCond parseRelCondition(Expr expr, Symbol loopSym, EvalFrame frame) {
+            if (!(expr instanceof BinaryExpr be)) return null;
+            if (!isCompareOp(be.op())) return null;
+
+            Expr boundExpr;
+            String op = be.op();
+            if (isIdOf(be.left(), loopSym)) {
+                boundExpr = be.right();
+            } else if (isIdOf(be.right(), loopSym)) {
+                boundExpr = be.left();
+                op = flipRelOp(be.op());
+            } else {
+                return null;
+            }
+            if (op == null || exprUsesSymbol(boundExpr, loopSym)) return null;
+            return new BulkRelCond(op, evalExpr(boundExpr, frame));
+        }
+
         private ModuloExpr parseModuloExpr(Expr expr, Symbol loopSym) {
             if (!(expr instanceof BinaryExpr be) || !"%".equals(be.op())) return null;
             if (!isIdOf(be.left(), loopSym)) return null;
@@ -804,6 +854,16 @@ public class CodeGenerator {
         private Integer literalValue(Expr expr) {
             if (expr instanceof LiteralExpr le) return le.value();
             return null;
+        }
+
+        private CountAndSum countMatches(int start, int step, long iterations, BulkCond cond) {
+            if (cond instanceof BulkModuloCond modCond) {
+                return countModuloMatches(start, step, iterations, modCond);
+            }
+            if (cond instanceof BulkRelCond relCond) {
+                return countRelMatches(start, step, iterations, relCond);
+            }
+            throw new ConstEvalBailout();
         }
 
         private CountAndSum countModuloMatches(int start, int step, long iterations, BulkModuloCond cond) {
@@ -824,6 +884,68 @@ public class CodeGenerator {
                 sum += c * (2L * first + (c - 1L) * stride) / 2L;
             }
             return new CountAndSum(count, sum);
+        }
+
+        private CountAndSum countRelMatches(int start, int step, long iterations, BulkRelCond cond) {
+            if (iterations <= 0) return new CountAndSum(0, 0);
+            if ("==".equals(cond.op) || "!=".equals(cond.op)) {
+                long idx = matchingIndex(start, step, iterations, cond.bound);
+                if ("==".equals(cond.op)) {
+                    return idx >= 0 ? new CountAndSum(1, cond.bound) : new CountAndSum(0, 0);
+                }
+                long total = arithmeticSeries(start, step, iterations);
+                return idx >= 0
+                        ? new CountAndSum(iterations - 1, total - cond.bound)
+                        : new CountAndSum(iterations, total);
+            }
+
+            boolean first = relHolds(start, cond.op, cond.bound);
+            long lastValue = start + (iterations - 1L) * step;
+            boolean last = relHolds(lastValue, cond.op, cond.bound);
+            if (first && last) {
+                return new CountAndSum(iterations, arithmeticSeries(start, step, iterations));
+            }
+            if (!first && !last) {
+                return new CountAndSum(0, 0);
+            }
+
+            if (first) {
+                long lo = 0, hi = iterations - 1;
+                while (lo < hi) {
+                    long mid = (lo + hi + 1) >>> 1;
+                    if (relHolds(start + mid * (long) step, cond.op, cond.bound)) lo = mid;
+                    else hi = mid - 1;
+                }
+                long count = lo + 1;
+                return new CountAndSum(count, arithmeticSeries(start, step, count));
+            }
+
+            long lo = 0, hi = iterations - 1;
+            while (lo < hi) {
+                long mid = (lo + hi) >>> 1;
+                if (relHolds(start + mid * (long) step, cond.op, cond.bound)) hi = mid;
+                else lo = mid + 1;
+            }
+            long count = iterations - lo;
+            long firstValue = start + lo * (long) step;
+            return new CountAndSum(count, arithmeticSeries((int) firstValue, step, count));
+        }
+
+        private long matchingIndex(int start, int step, long iterations, int wanted) {
+            long diff = (long) wanted - start;
+            if (step == 0 || diff % step != 0) return -1;
+            long idx = diff / step;
+            return idx >= 0 && idx < iterations ? idx : -1;
+        }
+
+        private boolean relHolds(long value, String op, int bound) {
+            return switch (op) {
+                case "<" -> value < bound;
+                case "<=" -> value <= bound;
+                case ">" -> value > bound;
+                case ">=" -> value >= bound;
+                default -> false;
+            };
         }
 
         private LoopUpdate parseLoopUpdate(AssignStmt stmt, Symbol target, Symbol loopSym, EvalFrame frame) {
@@ -1178,6 +1300,30 @@ public class CodeGenerator {
             };
         }
 
+        private boolean exprUsesAnySymbol(Expr expr, Set<Symbol> symbols, Symbol ignored) {
+            if (symbols.isEmpty()) return false;
+            return switch (expr) {
+                case IdExpr id -> {
+                    Symbol sym = analyzer.getIdSymbols().get(id);
+                    yield sym != null && sym != ignored && symbols.contains(sym);
+                }
+                case BinaryExpr be -> exprUsesAnySymbol(be.left(), symbols, ignored)
+                        || exprUsesAnySymbol(be.right(), symbols, ignored);
+                case UnaryExpr ue -> exprUsesAnySymbol(ue.operand(), symbols, ignored);
+                case CallExpr ce -> {
+                    boolean found = false;
+                    for (Expr arg : ce.args()) {
+                        if (exprUsesAnySymbol(arg, symbols, ignored)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    yield found;
+                }
+                default -> false;
+            };
+        }
+
         private int getValue(Symbol sym, EvalFrame frame) {
             if (sym.isConst() && sym.getConstValue() != null) return sym.getConstValue();
             Integer value = sym.isGlobal() ? globals.get(sym) : frame.locals.get(sym);
@@ -1237,9 +1383,11 @@ public class CodeGenerator {
     private record LoopGuard(IdExpr loopId, Expr boundExpr, String continueOp) {}
     private sealed interface BulkLoopStmt permits BulkUpdates, BulkIf {}
     private record BulkUpdates(List<LoopUpdate> updates) implements BulkLoopStmt {}
-    private record BulkIf(BulkModuloCond cond, List<LoopUpdate> thenUpdates,
+    private record BulkIf(BulkCond cond, List<LoopUpdate> thenUpdates,
                           List<LoopUpdate> elseUpdates) implements BulkLoopStmt {}
-    private record BulkModuloCond(int modulus, int remainder, boolean negate) {}
+    private sealed interface BulkCond permits BulkModuloCond, BulkRelCond {}
+    private record BulkModuloCond(int modulus, int remainder, boolean negate) implements BulkCond {}
+    private record BulkRelCond(String op, int bound) implements BulkCond {}
     private record ModuloExpr(int modulus) {}
     private record CountAndSum(long count, long sum) {}
     private record CallKey(String funcName, int[] args) {
@@ -1293,6 +1441,7 @@ public class CodeGenerator {
         lastStoreReg.clear();
         regValid.clear();
         symbolRegs.clear();
+        globalAddrRegs.clear();
         Arrays.fill(tempUsed, false);
         Arrays.fill(aUsed, false);
         codegenLoopDepth = 0;
@@ -1308,6 +1457,7 @@ public class CodeGenerator {
 
         Symbol funcSym = analyzer.getFuncSymbols().get(fd);
         assignSavedRegisters(fd);
+        assignGlobalAddressRegisters(fd);
         boolean leafParamsKeptInRegs = false;
         if (isLeaf && funcSym != null && funcSym.getFuncParamNames() != null) {
             leafParamsKeptInRegs = true;
@@ -1346,14 +1496,16 @@ public class CodeGenerator {
         int spillAreaSize = maxSpillDepth * 4;
 
         savedValueRegCount = symbolRegs.size();
+        int savedAddrRegCount = globalAddrRegs.size();
+        int savedCalleeRegCount = savedValueRegCount + savedAddrRegCount;
         boolean hasLocalsOrParams = finalLocalOffset < -8;
         boolean needsFrame = hasLocalsOrParams || maxSpillDepth > 0;
-        if (savedValueRegCount > 0) {
+        if (savedCalleeRegCount > 0) {
             needsFrame = true;
         }
 
         // Calculate frame size.
-        int savedRegsSize = (needsFrame || !isLeaf) ? 8 + savedValueRegCount * 4 : 0;
+        int savedRegsSize = (needsFrame || !isLeaf) ? 8 + savedCalleeRegCount * 4 : 0;
 
         int localSize = -finalLocalOffset - 8;
         if (localSize < 0) localSize = 0;
@@ -1371,7 +1523,7 @@ public class CodeGenerator {
                 emit("sw", "ra", (frameSize - 4) + "(sp)");
             }
             emit("sw", "s0", (frameSize - 8) + "(sp)");
-            for (int i = 0; i < savedValueRegCount; i++) {
+            for (int i = 0; i < savedCalleeRegCount; i++) {
                 emit("sw", SAVED_VALUE_REGS[i], (frameSize - 12 - i * 4) + "(sp)");
             }
             emit("addi", "s0", "sp", String.valueOf(frameSize));
@@ -1409,6 +1561,9 @@ public class CodeGenerator {
                 }
             }
         }
+        for (Map.Entry<Symbol, String> entry : globalAddrRegs.entrySet()) {
+            emit("la", entry.getValue(), entry.getKey().getName());
+        }
         if (!leafParamsKeptInRegs && funcSym != null
                 && funcSym.getFuncParamNames() != null && frameSize > 0) {
             int argReg = 0;
@@ -1445,7 +1600,7 @@ public class CodeGenerator {
             if (!isLeaf) {
                 emit("lw", "ra", (frameSize - 4) + "(sp)");
             }
-            for (int i = 0; i < savedValueRegCount; i++) {
+            for (int i = 0; i < savedCalleeRegCount; i++) {
                 emit("lw", SAVED_VALUE_REGS[i], (frameSize - 12 - i * 4) + "(sp)");
             }
             emit("lw", "s0", (frameSize - 8) + "(sp)");
@@ -1507,6 +1662,87 @@ public class CodeGenerator {
         int n = Math.min(SAVED_VALUE_REGS.length, candidates.size());
         for (int i = 0; i < n; i++) {
             symbolRegs.put(candidates.get(i).getKey(), SAVED_VALUE_REGS[i]);
+        }
+    }
+
+    private void assignGlobalAddressRegisters(FuncDef fd) {
+        if (!optimize) return;
+
+        int base = symbolRegs.size();
+        if (base >= SAVED_VALUE_REGS.length) return;
+
+        IdentityHashMap<Symbol, Integer> weights = new IdentityHashMap<>();
+        collectGlobalAccessWeights(fd.body(), weights, 0);
+
+        List<Map.Entry<Symbol, Integer>> candidates = new ArrayList<>();
+        for (Map.Entry<Symbol, Integer> entry : weights.entrySet()) {
+            Symbol sym = entry.getKey();
+            if (sym == null || !sym.isGlobal() || sym.isConst() || sym.isFunc()) continue;
+            if (entry.getValue() < 8) continue;
+            candidates.add(entry);
+        }
+        candidates.sort((a, b) -> {
+            int byWeight = Integer.compare(b.getValue(), a.getValue());
+            if (byWeight != 0) return byWeight;
+            return a.getKey().getName().compareTo(b.getKey().getName());
+        });
+
+        int n = Math.min(SAVED_VALUE_REGS.length - base, candidates.size());
+        for (int i = 0; i < n; i++) {
+            globalAddrRegs.put(candidates.get(i).getKey(), SAVED_VALUE_REGS[base + i]);
+        }
+    }
+
+    private void collectGlobalAccessWeights(Stmt stmt, IdentityHashMap<Symbol, Integer> weights, int loopDepth) {
+        switch (stmt) {
+            case Block b -> {
+                for (Stmt s : b.stmts()) {
+                    collectGlobalAccessWeights(s, weights, loopDepth);
+                }
+            }
+            case ExprStmt es -> collectGlobalExprWeights(es.expr(), weights, loopDepth);
+            case AssignStmt as_ -> {
+                Symbol target = analyzer.getAssignSymbols().get(as_);
+                if (target != null && target.isGlobal() && !target.isConst()) {
+                    weights.merge(target, weightFor(loopDepth) + 2, Integer::sum);
+                }
+                collectGlobalExprWeights(as_.value(), weights, loopDepth);
+            }
+            case VarDecl vd -> collectGlobalExprWeights(vd.initExpr(), weights, loopDepth);
+            case ConstDecl cd -> collectGlobalExprWeights(cd.initExpr(), weights, loopDepth);
+            case IfStmt is -> {
+                collectGlobalExprWeights(is.condition(), weights, loopDepth);
+                collectGlobalAccessWeights(is.thenStmt(), weights, loopDepth);
+                if (is.elseStmt() != null) collectGlobalAccessWeights(is.elseStmt(), weights, loopDepth);
+            }
+            case WhileStmt ws -> {
+                collectGlobalExprWeights(ws.condition(), weights, loopDepth + 1);
+                collectGlobalAccessWeights(ws.body(), weights, loopDepth + 1);
+            }
+            case ReturnStmt rs -> {
+                if (rs.value() != null) collectGlobalExprWeights(rs.value(), weights, loopDepth);
+            }
+            default -> {}
+        }
+    }
+
+    private void collectGlobalExprWeights(Expr expr, IdentityHashMap<Symbol, Integer> weights, int loopDepth) {
+        switch (expr) {
+            case IdExpr id -> {
+                Symbol sym = analyzer.getIdSymbols().get(id);
+                if (sym != null && sym.isGlobal() && !sym.isConst()) {
+                    weights.merge(sym, weightFor(loopDepth), Integer::sum);
+                }
+            }
+            case BinaryExpr be -> {
+                collectGlobalExprWeights(be.left(), weights, loopDepth);
+                collectGlobalExprWeights(be.right(), weights, loopDepth);
+            }
+            case UnaryExpr ue -> collectGlobalExprWeights(ue.operand(), weights, loopDepth);
+            case CallExpr ce -> {
+                for (Expr arg : ce.args()) collectGlobalExprWeights(arg, weights, loopDepth);
+            }
+            default -> {}
         }
     }
 
@@ -1853,13 +2089,18 @@ public class CodeGenerator {
                     }
                     emit("sw", r, localOff + "(s0)");
                 } else {
-                    Symbol sym = analyzer.getGlobalScope().lookup(as_.name());
+                    Symbol sym = targetSym;
                     if (sym != null && sym.isGlobal() && !sym.isConst()) {
                         // Store to global variable
-                        String addrReg = allocReg();
-                        emit("la", addrReg, sym.getName());
-                        emit("sw", r, "0(" + addrReg + ")");
-                        freeReg(addrReg);
+                        String addrReg = globalAddrRegs.get(sym);
+                        if (addrReg != null) {
+                            emit("sw", r, "0(" + addrReg + ")");
+                        } else {
+                            addrReg = allocReg();
+                            emit("la", addrReg, sym.getName());
+                            emit("sw", r, "0(" + addrReg + ")");
+                            freeReg(addrReg);
+                        }
                     } else {
                         // Parameter or other local not yet allocated
                         int offset = getLocalOffset(as_.name());
@@ -2055,9 +2296,9 @@ public class CodeGenerator {
             }
         }
 
-        String r = genExpr(expr);
-        emit("beqz", r, label);
-        freeReg(r);
+        BranchOperand operand = branchOperand(expr);
+        emit("beqz", operand.reg, label);
+        freeBranchOperand(operand);
     }
 
     private void genBranchIfTrue(Expr expr, String label) {
@@ -2084,9 +2325,9 @@ public class CodeGenerator {
             }
         }
 
-        String r = genExpr(expr);
-        emit("bnez", r, label);
-        freeReg(r);
+        BranchOperand operand = branchOperand(expr);
+        emit("bnez", operand.reg, label);
+        freeBranchOperand(operand);
     }
 
     private boolean isCompareOp(String op) {
@@ -2095,8 +2336,10 @@ public class CodeGenerator {
     }
 
     private void emitCompareBranch(String op, boolean branchOnTrue, Expr left, Expr right, String label) {
-        String l = genExpr(left);
-        String r = genExpr(right);
+        BranchOperand lOp = branchOperand(left);
+        BranchOperand rOp = branchOperand(right);
+        String l = lOp.reg;
+        String r = rOp.reg;
 
         if (branchOnTrue) {
             switch (op) {
@@ -2120,8 +2363,39 @@ public class CodeGenerator {
             }
         }
 
-        freeReg(r);
-        freeReg(l);
+        freeBranchOperand(rOp);
+        freeBranchOperand(lOp);
+    }
+
+    private BranchOperand branchOperand(Expr expr) {
+        if (expr instanceof LiteralExpr le && le.value() == 0) {
+            return new BranchOperand("zero", false);
+        }
+        if (expr instanceof IdExpr id) {
+            Symbol sym = analyzer.getIdSymbols().get(id);
+            if (sym != null) {
+                if (sym.isConst() && sym.getConstValue() != null && sym.getConstValue() == 0) {
+                    return new BranchOperand("zero", false);
+                }
+                String savedReg = symbolRegs.get(sym);
+                if (savedReg != null) {
+                    return new BranchOperand(savedReg, false);
+                }
+                if (optimize) {
+                    String lsReg = lastStoreReg.get(id.name());
+                    if (lsReg != null && regValid.contains(lsReg)) {
+                        return new BranchOperand(lsReg, false);
+                    }
+                }
+            }
+        }
+        return new BranchOperand(genExpr(expr), true);
+    }
+
+    private void freeBranchOperand(BranchOperand operand) {
+        if (operand.owned) {
+            freeReg(operand.reg);
+        }
     }
 
     private List<Set<Symbol>> buildSuffixUses(List<Stmt> stmts) {
@@ -2522,9 +2796,14 @@ public class CodeGenerator {
 
         String r = allocReg();
         if (sym.isGlobal()) {
-            // Load from global address: la r, sym; lw r, 0(r)
-            emit("la", r, sym.getName());
-            emit("lw", r, "0(" + r + ")");
+            // Load from global address. Hot globals keep their address in s-regs.
+            String addrReg = globalAddrRegs.get(sym);
+            if (addrReg != null) {
+                emit("lw", r, "0(" + addrReg + ")");
+            } else {
+                emit("la", r, sym.getName());
+                emit("lw", r, "0(" + r + ")");
+            }
         } else if (currentFuncIsLeaf && sym.getKind() == Symbol.Kind.PARAM
                 && lookupLocalOffset(id.name()) == null) {
             // Leaf function: parameter kept in its original a-register
@@ -2812,7 +3091,7 @@ public class CodeGenerator {
      */
     private boolean exprContainsCall(Expr expr) {
         return switch (expr) {
-            case CallExpr ce -> true;
+            case CallExpr ce -> !canInlineCall(ce);
             case BinaryExpr be -> exprContainsCall(be.left()) || exprContainsCall(be.right());
             case UnaryExpr ue -> exprContainsCall(ue.operand());
             default -> false;
@@ -2928,6 +3207,11 @@ public class CodeGenerator {
     }
 
     private String genCall(CallExpr ce) {
+        if (optimize) {
+            String inlined = tryGenInlineCall(ce);
+            if (inlined != null) return inlined;
+        }
+
         if (ce.args().size() > NUM_TEMPS) {
             return genLargeCall(ce);
         }
@@ -3068,6 +3352,119 @@ public class CodeGenerator {
         String resultReg = allocReg();
         emit("mv", resultReg, "a0");
         return resultReg;
+    }
+
+    private String tryGenInlineCall(CallExpr ce) {
+        if (!canInlineCall(ce)) return null;
+
+        FuncDef fd = functionsByName.get(ce.funcName());
+        Expr returnExpr = singleReturnExpr(fd.body());
+        List<Symbol> params = analyzer.getFuncParamSymbols().get(fd);
+
+        String[] argRegs = new String[ce.args().size()];
+        for (int i = 0; i < ce.args().size(); i++) {
+            argRegs[i] = genExpr(ce.args().get(i));
+        }
+
+        IdentityHashMap<Symbol, String> paramRegs = new IdentityHashMap<>();
+        for (int i = 0; i < params.size(); i++) {
+            paramRegs.put(params.get(i), argRegs[i]);
+        }
+        String result = genInlineExpr(returnExpr, paramRegs);
+        for (String argReg : argRegs) {
+            freeReg(argReg);
+        }
+        return result;
+    }
+
+    private Expr singleReturnExpr(Stmt stmt) {
+        if (stmt instanceof ReturnStmt rs) return rs.value();
+        if (stmt instanceof Block b && b.stmts().size() == 1 && b.stmts().get(0) instanceof ReturnStmt rs) {
+            return rs.value();
+        }
+        return null;
+    }
+
+    private boolean canInlineCall(CallExpr ce) {
+        if (!optimize) return false;
+        FuncDef fd = functionsByName.get(ce.funcName());
+        if (fd == null || fd == currentFunc) return false;
+        Expr returnExpr = singleReturnExpr(fd.body());
+        if (returnExpr == null || !isInlineExpr(returnExpr) || containsShortCircuit(returnExpr)) return false;
+        List<Symbol> params = analyzer.getFuncParamSymbols().get(fd);
+        if (params == null || params.size() != ce.args().size() || params.size() > 6) return false;
+        for (Expr arg : ce.args()) {
+            if (exprHasCallRaw(arg)) return false;
+        }
+        return true;
+    }
+
+    private boolean isInlineExpr(Expr expr) {
+        return switch (expr) {
+            case LiteralExpr ignored -> true;
+            case IdExpr ignored -> true;
+            case UnaryExpr ue -> isInlineExpr(ue.operand());
+            case BinaryExpr be -> isInlineExpr(be.left()) && isInlineExpr(be.right());
+            case CallExpr ignored -> false;
+        };
+    }
+
+    private boolean containsShortCircuit(Expr expr) {
+        return switch (expr) {
+            case BinaryExpr be -> "&&".equals(be.op()) || "||".equals(be.op())
+                    || containsShortCircuit(be.left()) || containsShortCircuit(be.right());
+            case UnaryExpr ue -> containsShortCircuit(ue.operand());
+            case CallExpr ce -> true;
+            default -> false;
+        };
+    }
+
+    private boolean exprHasCallRaw(Expr expr) {
+        return switch (expr) {
+            case CallExpr ignored -> true;
+            case BinaryExpr be -> exprHasCallRaw(be.left()) || exprHasCallRaw(be.right());
+            case UnaryExpr ue -> exprHasCallRaw(ue.operand());
+            default -> false;
+        };
+    }
+
+    private String genInlineExpr(Expr expr, IdentityHashMap<Symbol, String> paramRegs) {
+        return switch (expr) {
+            case LiteralExpr le -> genLiteral(le);
+            case IdExpr id -> {
+                Symbol sym = analyzer.getIdSymbols().get(id);
+                String paramReg = paramRegs.get(sym);
+                if (paramReg != null) {
+                    String r = allocReg();
+                    emit("mv", r, paramReg);
+                    yield r;
+                }
+                yield genId(id);
+            }
+            case UnaryExpr ue -> {
+                String operand = genInlineExpr(ue.operand(), paramRegs);
+                String result = allocReg();
+                switch (ue.op()) {
+                    case "+" -> emit("mv", result, operand);
+                    case "-" -> emit("sub", result, "zero", operand);
+                    case "!" -> emit("seqz", result, operand);
+                    default -> emit("mv", result, operand);
+                }
+                freeReg(operand);
+                yield result;
+            }
+            case BinaryExpr be -> {
+                String left = genInlineExpr(be.left(), paramRegs);
+                if (be.right() instanceof LiteralExpr rle && tryEmitRightLiteralOp(be.op(), left, rle.value())) {
+                    yield left;
+                }
+                String right = genInlineExpr(be.right(), paramRegs);
+                emitBinaryOp(be.op(), left, left, right);
+                freeReg(right);
+                yield left;
+            }
+            case CallExpr ce -> throw new IllegalStateException("inline call expression was pre-filtered");
+        };
     }
 
     private String genLargeCall(CallExpr ce) {

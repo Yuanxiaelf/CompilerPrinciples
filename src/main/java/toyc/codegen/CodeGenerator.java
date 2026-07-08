@@ -1040,50 +1040,6 @@ public class CodeGenerator {
             }
         }
 
-        // Optimization: if right operand is a simple literal and the
-        // operation can use an immediate form, skip evaluating the right
-        // operand into a register entirely. This avoids dead li instructions.
-        if (optimize && be.right() instanceof LiteralExpr rle
-                && !exprContainsCall(be.left())) {
-            int imm = rle.value();
-            String resultReg = genExpr(be.left());
-
-            // Try algebraic identities first
-            boolean handled = false;
-            switch (be.op()) {
-                case "+" -> { if (imm == 0) handled = true; }
-                case "-" -> { if (imm == 0) handled = true; }
-                case "*" -> {
-                    if (imm == 0) { emit("mv", resultReg, "zero"); handled = true; }
-                    else if (imm == 1) handled = true;
-                    else if ((imm & (imm - 1)) == 0) {
-                        int shift = Integer.numberOfTrailingZeros(imm);
-                        emit("slli", resultReg, resultReg, String.valueOf(shift));
-                        handled = true;
-                    }
-                }
-                case "/" -> { if (imm == 1) handled = true; }
-                case "%" -> {
-                    if (imm == 1) { emit("mv", resultReg, "zero"); handled = true; }
-                }
-            }
-            if (handled) return resultReg;
-
-            // Try immediate-form instruction
-            if (tryEmitImmOp(be.op(), resultReg, resultReg, imm))
-                return resultReg;
-
-            // Fall through: need a register for the literal after all.
-            // But we already evaluated left — allocate right and proceed.
-            String rightReg = allocReg();
-            emit("li", rightReg, String.valueOf(imm));
-            emitBinaryOp(be.op(), resultReg, resultReg, rightReg);
-            freeReg(rightReg);
-            return resultReg;
-        }
-
-        // ---- General case: evaluate both operands ----
-
         String leftReg = genExpr(be.left());
 
         // Only spill left if the right operand contains a function call
@@ -1106,75 +1062,13 @@ public class CodeGenerator {
         // Strength reduction: use immediate instructions when possible
         if (optimize && be.right() instanceof LiteralExpr rle) {
             int imm = rle.value();
-            switch (be.op()) {
-                case "+" -> {
-                    if (imm == 0) { freeReg(rightReg); return resultReg; }
-                }
-                case "-" -> {
-                    if (imm == 0) { freeReg(rightReg); return resultReg; }
-                }
-                case "*" -> {
-                    if (imm == 0) {
-                        emit("mv", resultReg, "zero");
-                        freeReg(rightReg); return resultReg;
-                    }
-                    if (imm == 1) { freeReg(rightReg); return resultReg; }
-                    if ((imm & (imm - 1)) == 0) {
-                        int shift = Integer.numberOfTrailingZeros(imm);
-                        emit("slli", resultReg, resultReg, String.valueOf(shift));
-                        freeReg(rightReg);
-                        return resultReg;
-                    }
-                }
-                case "/" -> {
-                    if (imm == 1) { freeReg(rightReg); return resultReg; }
-                }
-                case "%" -> {
-                    if (imm == 1) {
-                        emit("mv", resultReg, "zero");
-                        freeReg(rightReg); return resultReg;
-                    }
-                }
-            }
             if (tryEmitImmOp(be.op(), resultReg, resultReg, imm)) {
                 freeReg(rightReg);
                 return resultReg;
             }
         }
 
-        // Commutative left-literal folding: 0 + x → x, 1 * x → x, etc.
-        if (optimize && be.left() instanceof LiteralExpr lle) {
-            int imm = lle.value();
-            switch (be.op()) {
-                case "+" -> {
-                    if (imm == 0) {
-                        if (resultReg != rightReg) freeReg(resultReg);
-                        freeReg(leftReg);
-                        return rightReg;
-                    }
-                }
-                case "*" -> {
-                    if (imm == 0) {
-                        emit("mv", resultReg, "zero");
-                        freeReg(rightReg);
-                        return resultReg;
-                    }
-                    if (imm == 1) {
-                        if (resultReg != rightReg) freeReg(resultReg);
-                        freeReg(leftReg);
-                        return rightReg;
-                    }
-                }
-                case "-" -> {
-                    if (imm == 0) {
-                        emit("sub", resultReg, "zero", rightReg);
-                        freeReg(rightReg);
-                        return resultReg;
-                    }
-                }
-            }
-        }
-
+        // resultReg holds left value; apply operator with rightReg
         emitBinaryOp(be.op(), resultReg, resultReg, rightReg);
         freeReg(rightReg);
         return resultReg;

@@ -24,8 +24,9 @@ public class CodeGenerator {
     private static final boolean enableBlockDce = false;
     private static final boolean enableInterpreterBranchBulk = false;
     private static final boolean enableInterpreterModuloBranchBulk = true;
+    private static final boolean enableInterpreterRelBranchBulk = true;
     private static final boolean enableGlobalAddrCache = true;
-    private static final boolean enableSmallFunctionInline = true;
+    private static final boolean enableSmallFunctionInline = false;
     private static final boolean enableWhileConstHoist = false;
     private static final boolean enableCompareImmBranch = false;
     private final StringBuilder sb;
@@ -758,7 +759,7 @@ public class CodeGenerator {
                             ? parseBranchUpdates(is.elseStmt(), loopSym, frame, assignedInLoop)
                             : List.of();
                     if (elseUpdates == null) return false;
-                    if (!isSafeModuloBranchUpdates(branchAssigned, thenUpdates, elseUpdates)) return false;
+                    if (!isSafeSingleAccumulatorBranchUpdates(branchAssigned, thenUpdates, elseUpdates)) return false;
                     bulkStmts.add(new BulkIf(bulkCond, thenUpdates, elseUpdates));
                     cumulativeUpdates.addAll(branchAssigned);
                 } else {
@@ -789,18 +790,18 @@ public class CodeGenerator {
         }
 
         private boolean isAllowedBranchBulk(BulkCond cond, Set<Symbol> branchAssigned) {
-            if (!enableInterpreterModuloBranchBulk || enableInterpreterBranchBulk) {
-                return enableInterpreterBranchBulk || (enableInterpreterModuloBranchBulk && cond instanceof BulkModuloCond);
-            }
-            if (!(cond instanceof BulkModuloCond)) return false;
+            if (enableInterpreterBranchBulk) return true;
+            boolean condAllowed = cond instanceof BulkModuloCond && enableInterpreterModuloBranchBulk
+                    || cond instanceof BulkRelCond && enableInterpreterRelBranchBulk;
+            if (!condAllowed) return false;
             if (branchAssigned.size() != 1) return false;
             Symbol target = branchAssigned.iterator().next();
             return target != null && !target.isGlobal() && !target.isConst() && !target.isFunc();
         }
 
-        private boolean isSafeModuloBranchUpdates(Set<Symbol> branchAssigned,
-                                                  List<LoopUpdate> thenUpdates,
-                                                  List<LoopUpdate> elseUpdates) {
+        private boolean isSafeSingleAccumulatorBranchUpdates(Set<Symbol> branchAssigned,
+                                                             List<LoopUpdate> thenUpdates,
+                                                             List<LoopUpdate> elseUpdates) {
             if (enableInterpreterBranchBulk) return true;
             if (branchAssigned.size() != 1) return false;
             Symbol target = branchAssigned.iterator().next();

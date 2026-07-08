@@ -25,7 +25,7 @@ public class CodeGenerator {
     private static final boolean enableInterpreterBranchBulk = false;
     private static final boolean enableInterpreterModuloBranchBulk = true;
     private static final boolean enableGlobalAddrCache = true;
-    private static final boolean enableSmallFunctionInline = false;
+    private static final boolean enableSmallFunctionInline = true;
     private static final boolean enableWhileConstHoist = false;
     private static final boolean enableCompareImmBranch = false;
     private final StringBuilder sb;

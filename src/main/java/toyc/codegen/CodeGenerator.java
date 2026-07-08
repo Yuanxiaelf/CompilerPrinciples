@@ -374,7 +374,7 @@ public class CodeGenerator {
                     }
                 }
                 case WhileStmt ws -> {
-                    if (tryRunCountedLoop(ws, frame)) {
+                    if (tryRunPolynomialLoop(ws, frame) || tryRunCountedLoop(ws, frame)) {
                         // Loop was evaluated in bulk.
                     } else {
                         while (evalExpr(ws.condition(), frame) != 0) {
@@ -469,6 +469,121 @@ public class CodeGenerator {
             if (--fuel <= 0 || (fuel & 0x3fff) == 0 && System.nanoTime() > deadlineNs) {
                 throw new ConstEvalBailout();
             }
+        }
+
+        private boolean tryRunPolynomialLoop(WhileStmt ws, EvalFrame frame) {
+            CountedLoopInfo info = parseCountedLoop(ws, frame);
+            if (info == null || info.iterations <= 0) return info != null && info.iterations == 0;
+
+            IdentityHashMap<Symbol, Poly> env = new IdentityHashMap<>();
+            List<LoopUpdate> updates = new ArrayList<>();
+            IdentityHashMap<Symbol, Poly> finalAssignments = new IdentityHashMap<>();
+            boolean sawStep = false;
+
+            for (Stmt stmt : info.stmts) {
+                if (stmt instanceof VarDecl vd) {
+                    Symbol target = analyzer.getVarDeclSymbols().get(vd);
+                    Poly value = evalPolyWithEnv(vd.initExpr(), info.loopSym, frame, env);
+                    if (target == null || value == null) return false;
+                    env.put(target, value);
+                } else if (stmt instanceof ConstDecl cd) {
+                    Symbol target = analyzer.getConstDeclSymbols().get(cd);
+                    if (target != null && target.getConstValue() != null) {
+                        env.put(target, new Poly(target.getConstValue(), 0, 0));
+                    }
+                } else if (stmt instanceof AssignStmt as_) {
+                    Symbol target = analyzer.getAssignSymbols().get(as_);
+                    if (target == null) return false;
+                    if (target == info.loopSym) {
+                        Integer parsedStep = parseSelfStep(as_.value(), info.loopSym);
+                        if (parsedStep == null || parsedStep != info.step || sawStep) return false;
+                        sawStep = true;
+                        continue;
+                    }
+
+                    if (env.containsKey(target)) {
+                        Poly value = evalPolyWithEnv(as_.value(), info.loopSym, frame, env);
+                        if (value == null) return false;
+                        env.put(target, value);
+                        finalAssignments.put(target, value);
+                        continue;
+                    }
+
+                    Poly delta = extractSelfPolyDeltaWithEnv(as_.value(), target, info.loopSym, frame, env);
+                    if (delta != null) {
+                        updates.add(new LoopUpdate(target, delta.constant, delta.linear, delta.quadratic));
+                    } else {
+                        Poly value = evalPolyWithEnv(as_.value(), info.loopSym, frame, env);
+                        if (value == null) return false;
+                        env.put(target, value);
+                        finalAssignments.put(target, value);
+                    }
+                } else {
+                    return false;
+                }
+            }
+            if (!sawStep) return false;
+
+            long sumI = arithmeticSeries(info.start, info.step, info.iterations);
+            long sumI2 = squareSeries(info.start, info.step, info.iterations);
+            applyBulkUpdates(updates, info.iterations, sumI, sumI2, frame);
+
+            int lastI = (int) (info.start + (info.iterations - 1L) * info.step);
+            for (Map.Entry<Symbol, Poly> entry : finalAssignments.entrySet()) {
+                setValue(entry.getKey(), entry.getValue().eval(lastI), frame);
+            }
+            setValue(info.loopSym, (int) (info.start + info.iterations * info.step), frame);
+            tick();
+            return true;
+        }
+
+        private CountedLoopInfo parseCountedLoop(WhileStmt ws, EvalFrame frame) {
+            IdExpr loopId;
+            Expr boundExpr;
+            String condOp;
+            if (ws.condition() instanceof BinaryExpr cond) {
+                if (!(cond.left() instanceof IdExpr id)) return null;
+                if (!("<".equals(cond.op()) || "<=".equals(cond.op())
+                        || ">".equals(cond.op()) || ">=".equals(cond.op())
+                        || "!=".equals(cond.op()))) return null;
+                loopId = id;
+                boundExpr = cond.right();
+                condOp = cond.op();
+            } else if (ws.condition() instanceof IdExpr id) {
+                loopId = id;
+                boundExpr = new LiteralExpr(0, id.line());
+                condOp = "!=";
+            } else {
+                return null;
+            }
+
+            Symbol loopSym = analyzer.getIdSymbols().get(loopId);
+            if (loopSym == null || exprUsesSymbol(boundExpr, loopSym)) return null;
+
+            List<Stmt> stmts;
+            if (ws.body() instanceof Block b) stmts = b.stmts();
+            else stmts = List.of(ws.body());
+
+            int step = 0;
+            boolean sawStep = false;
+            for (Stmt stmt : stmts) {
+                if (stmt instanceof AssignStmt as_) {
+                    Symbol target = analyzer.getAssignSymbols().get(as_);
+                    if (target == loopSym) {
+                        if (sawStep) return null;
+                        Integer parsedStep = parseSelfStep(as_.value(), loopSym);
+                        if (parsedStep == null || parsedStep == 0) return null;
+                        sawStep = true;
+                        step = parsedStep;
+                    }
+                }
+            }
+            if (!sawStep) return null;
+            int start = getValue(loopSym, frame);
+            int bound = evalExpr(boundExpr, frame);
+            long iterations = countIterations(start, bound, step, condOp);
+            if (iterations < 0) return null;
+            return new CountedLoopInfo(loopSym, stmts, start, step, iterations);
         }
 
         private boolean tryRunCountedLoop(WhileStmt ws, EvalFrame frame) {
@@ -793,6 +908,72 @@ public class CodeGenerator {
             };
         }
 
+        private Poly evalPolyWithEnv(Expr expr, Symbol loopSym, EvalFrame frame,
+                                     IdentityHashMap<Symbol, Poly> env) {
+            return switch (expr) {
+                case LiteralExpr le -> new Poly(le.value(), 0, 0);
+                case IdExpr id -> {
+                    Symbol sym = analyzer.getIdSymbols().get(id);
+                    if (sym == loopSym) yield new Poly(0, 1, 0);
+                    Poly local = env.get(sym);
+                    if (local != null) yield local;
+                    if (sym == null) yield null;
+                    yield new Poly(getValue(sym, frame), 0, 0);
+                }
+                case UnaryExpr ue -> {
+                    Poly p = evalPolyWithEnv(ue.operand(), loopSym, frame, env);
+                    if (p == null) yield null;
+                    yield switch (ue.op()) {
+                        case "+" -> p;
+                        case "-" -> p.negate();
+                        default -> null;
+                    };
+                }
+                case BinaryExpr be -> {
+                    Poly l = evalPolyWithEnv(be.left(), loopSym, frame, env);
+                    Poly r = evalPolyWithEnv(be.right(), loopSym, frame, env);
+                    if (l == null || r == null) yield null;
+                    yield switch (be.op()) {
+                        case "+" -> l.add(r);
+                        case "-" -> l.subtract(r);
+                        case "*" -> l.multiply(r);
+                        default -> null;
+                    };
+                }
+                case CallExpr ce -> {
+                    Affine a = evalAffineCall(ce, loopSym, frame);
+                    yield a != null ? new Poly(a.constant, a.coefficient, 0) : null;
+                }
+                default -> null;
+            };
+        }
+
+        private Poly extractSelfPolyDeltaWithEnv(Expr expr, Symbol target, Symbol loopSym,
+                                                 EvalFrame frame, IdentityHashMap<Symbol, Poly> env) {
+            if (isIdOf(expr, target)) return new Poly(0, 0, 0);
+            if (expr instanceof BinaryExpr be) {
+                if ("+".equals(be.op())) {
+                    Poly leftSelf = extractSelfPolyDeltaWithEnv(be.left(), target, loopSym, frame, env);
+                    if (leftSelf != null) {
+                        Poly right = evalPolyWithEnv(be.right(), loopSym, frame, env);
+                        return right != null ? leftSelf.add(right) : null;
+                    }
+                    Poly rightSelf = extractSelfPolyDeltaWithEnv(be.right(), target, loopSym, frame, env);
+                    if (rightSelf != null) {
+                        Poly left = evalPolyWithEnv(be.left(), loopSym, frame, env);
+                        return left != null ? left.add(rightSelf) : null;
+                    }
+                } else if ("-".equals(be.op())) {
+                    Poly leftSelf = extractSelfPolyDeltaWithEnv(be.left(), target, loopSym, frame, env);
+                    if (leftSelf != null) {
+                        Poly right = evalPolyWithEnv(be.right(), loopSym, frame, env);
+                        return right != null ? leftSelf.subtract(right) : null;
+                    }
+                }
+            }
+            return null;
+        }
+
         private Affine evalAffineCall(CallExpr ce, Symbol loopSym, EvalFrame frame) {
             FuncDef fd = funcs.get(ce.funcName());
             if (fd == null || !Boolean.TRUE.equals(pureFuncs.get(ce.funcName()))) return null;
@@ -984,8 +1165,13 @@ public class CodeGenerator {
             int q = constant * other.quadratic + linear * other.linear + quadratic * other.constant;
             return new Poly(c, l, q);
         }
+
+        int eval(int x) {
+            return constant + linear * x + quadratic * x * x;
+        }
     }
     private record LoopUpdate(Symbol target, int constant, int coefficient, int quadratic) {}
+    private record CountedLoopInfo(Symbol loopSym, List<Stmt> stmts, int start, int step, long iterations) {}
     private sealed interface BulkLoopStmt permits BulkUpdates, BulkIf {}
     private record BulkUpdates(List<LoopUpdate> updates) implements BulkLoopStmt {}
     private record BulkIf(BulkModuloCond cond, List<LoopUpdate> thenUpdates,

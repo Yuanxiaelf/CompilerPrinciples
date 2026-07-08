@@ -13,14 +13,15 @@ public class CodeGenerator {
 
     private final SemanticAnalyzer analyzer;
     private final boolean optimize;
-    private static final int INTERPRETER_FUEL = 200_000_000;
-    private static final long INTERPRETER_TIME_NS = 5_000_000_000L;
-    private static final int INTERPRETER_MAX_AST_NODES = 200_000;
+    private static final int INTERPRETER_FUEL = 60_000_000;
+    private static final long INTERPRETER_TIME_NS = 2_000_000_000L;
+    private static final int INTERPRETER_MAX_AST_NODES = 50_000;
     // Register cache DISABLED: stable-register approach causes correctness
     // bugs (wrong output on p01-p05, timeouts on p06-p12). Requires proper
     // liveness analysis and SSA-based register allocation to work safely.
     // The simpler optimizations below are safe and still provide good speedups.
     private static final boolean enableRegCache = false;
+    private static final boolean enableBlockDce = true;
     private final StringBuilder sb;
     private int labelCounter;
     private final Deque<LoopLabels> loopStack;
@@ -41,6 +42,7 @@ public class CodeGenerator {
     private FuncDef currentFunc;
     private boolean currentFuncIsLeaf;
     private String currentFuncBodyLabel;
+    private int codegenLoopDepth;
     private final Deque<Map<String, Integer>> localOffsetStack = new ArrayDeque<>(); // scoped variable → offset from fp
     private int nextLocalOffset; // grows downward (negative)
 
@@ -827,6 +829,7 @@ public class CodeGenerator {
         symbolRegs.clear();
         Arrays.fill(tempUsed, false);
         Arrays.fill(aUsed, false);
+        codegenLoopDepth = 0;
         nextLocalOffset = -8; // skip past saved ra (-4) and saved fp (-8)
 
         // Count locals declared in the body
@@ -1317,7 +1320,8 @@ public class CodeGenerator {
                     Stmt s = stmts.get(i);
                     if (s instanceof VarDecl vd) blockVars.add(vd.name());
                     else if (s instanceof ConstDecl cd) blockVars.add(cd.name());
-                    if (optimize && isDeadForLiveOut(s, suffixUses.get(i + 1))) {
+                    if (enableBlockDce && optimize && codegenLoopDepth == 0
+                            && isDeadForLiveOut(s, suffixUses.get(i + 1))) {
                         if (s instanceof VarDecl vd) allocateLocal(vd.name());
                         else if (s instanceof ConstDecl cd) allocateLocal(cd.name());
                         continue;
@@ -1524,7 +1528,9 @@ public class CodeGenerator {
         freeReg(condReg);
 
         emitLabel(bodyLabel);
+        codegenLoopDepth++;
         genStmt(ws.body());
+        codegenLoopDepth--;
         emit("j", startLabel);
 
         emitLabel(endLabel);

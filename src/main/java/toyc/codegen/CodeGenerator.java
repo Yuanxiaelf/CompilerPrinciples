@@ -26,9 +26,9 @@ public class CodeGenerator {
     private static final boolean enableInterpreterModuloBranchBulk = true;
     private static final boolean enableInterpreterRelBranchBulk = true;
     private static final boolean enableGlobalAddrCache = true;
-    private static final boolean enableSmallFunctionInline = false;
-    private static final boolean enableWhileConstHoist = false;
-    private static final boolean enableCompareImmBranch = false;
+    private static final boolean enableSmallFunctionInline = true;
+    private static final boolean enableWhileConstHoist = true;
+    private static final boolean enableCompareImmBranch = true;
     private final StringBuilder sb;
     private int labelCounter;
     private final Deque<LoopLabels> loopStack;
@@ -3633,10 +3633,28 @@ public class CodeGenerator {
         if (returnExpr == null || !isInlineExpr(returnExpr) || containsShortCircuit(returnExpr)) return false;
         List<Symbol> params = analyzer.getFuncParamSymbols().get(fd);
         if (params == null || params.size() != ce.args().size() || params.size() > 6) return false;
+        Set<Symbol> paramSet = newIdentitySet();
+        paramSet.addAll(params);
+        if (!inlineExprUsesOnlyParamsAndConsts(returnExpr, paramSet)) return false;
         for (Expr arg : ce.args()) {
             if (exprHasCallRaw(arg)) return false;
         }
         return true;
+    }
+
+    private boolean inlineExprUsesOnlyParamsAndConsts(Expr expr, Set<Symbol> params) {
+        return switch (expr) {
+            case LiteralExpr ignored -> true;
+            case IdExpr id -> {
+                Symbol sym = analyzer.getIdSymbols().get(id);
+                yield sym != null && (params.contains(sym)
+                        || (sym.isConst() && sym.getConstValue() != null));
+            }
+            case UnaryExpr ue -> inlineExprUsesOnlyParamsAndConsts(ue.operand(), params);
+            case BinaryExpr be -> inlineExprUsesOnlyParamsAndConsts(be.left(), params)
+                    && inlineExprUsesOnlyParamsAndConsts(be.right(), params);
+            case CallExpr ignored -> false;
+        };
     }
 
     private boolean isInlineExpr(Expr expr) {

@@ -142,6 +142,7 @@ public class CodeGenerator {
         sRegDirty.clear();
         usedSRegs.clear();
         sRegSaveOffset.clear();
+        leakedSRegs.clear();
 
         // Determine whether this is a leaf function (no calls in body)
         boolean isLeaf = !stmtContainsCall(fd.body());
@@ -164,8 +165,25 @@ public class CodeGenerator {
                 }
             }
 
+            // Collect the set of names that exist in local scope
+            // (locals, params, or consts). Globals must NOT be cached
+            // in s-regs because they live in .data, not on the stack.
+            Set<String> localNames = new HashSet<>();
+            collectLocalNames(fd.body(), localNames);
+            if (funcSym != null && funcSym.getFuncParamNames() != null) {
+                localNames.addAll(funcSym.getFuncParamNames());
+            }
+
+            // Detect shadowed names: if a name is declared in more than one
+            // scope, skip it. Otherwise the s-reg would hold the wrong
+            // variable's value for the inner/outer declaration.
+            Set<String> shadowedNames = new HashSet<>();
+            findShadowedNames(fd.body(), new HashSet<>(), shadowedNames);
+
             List<String> sortedVars = varUseCounts.entrySet().stream()
                 .filter(e -> e.getValue() >= 2) // only cache if used 2+ times
+                .filter(e -> localNames.contains(e.getKey())) // exclude globals
+                .filter(e -> !shadowedNames.contains(e.getKey())) // exclude shadowed
                 .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
                 .map(Map.Entry::getKey)
                 .toList();
@@ -220,7 +238,7 @@ public class CodeGenerator {
         int spillAreaSize = maxSpillDepth * 4;
 
         boolean hasLocalsOrParams = finalLocalOffset < -(8 + sRegSaveCount * 4);
-        boolean needsFrame = hasLocalsOrParams || maxSpillDepth > 0;
+        boolean needsFrame = hasLocalsOrParams || maxSpillDepth > 0 || sRegSaveCount > 0;
 
         // Calculate frame size — include space for saved s-registers.
         int savedRegsSize = (needsFrame || !isLeaf) ? 8 : 0; // ra + s0
@@ -299,6 +317,28 @@ public class CodeGenerator {
             }
         }
 
+        // Even when leafParamsKeptInRegs is true, we must still initialize
+        // s-registers for parameters that were assigned to s-regs.
+        // (The s-reg cache takes priority over the a-reg/stack in genId.)
+        if (leafParamsKeptInRegs && optimize && funcSym != null
+                && funcSym.getFuncParamNames() != null) {
+            int argReg = 0;
+            for (String paramName : funcSym.getFuncParamNames()) {
+                String sReg = varToSReg.get(paramName);
+                if (sReg != null) {
+                    if (argReg < 8) {
+                        emit("mv", sReg, "a" + argReg);
+                    } else if (frameSize > 0) {
+                        // Extra param arrives on caller's outgoing arg area.
+                        int callerOff = frameSize + (argReg - 8) * 4;
+                        emit("lw", sReg, callerOff + "(sp)");
+                    }
+                    sRegDirty.add(sReg);
+                }
+                argReg++;
+            }
+        }
+
         // Generate body
         genStmt(fd.body());
 
@@ -320,6 +360,61 @@ public class CodeGenerator {
         emit("ret");
 
         currentFunc = null;
+    }
+
+    /** Find names declared in more than one (nested) scope. */
+    private void findShadowedNames(Stmt stmt, Set<String> outerNames,
+                                   Set<String> shadowed) {
+        switch (stmt) {
+            case Block b -> {
+                Set<String> blockNames = new HashSet<>();
+                collectBlockDeclNames(b, blockNames);
+                for (String n : blockNames) {
+                    if (outerNames.contains(n)) shadowed.add(n);
+                }
+                Set<String> combined = new HashSet<>(outerNames);
+                combined.addAll(blockNames);
+                for (Stmt s : b.stmts()) {
+                    findShadowedNames(s, combined, shadowed);
+                }
+            }
+            case IfStmt is -> {
+                findShadowedNames(is.thenStmt(), outerNames, shadowed);
+                if (is.elseStmt() != null)
+                    findShadowedNames(is.elseStmt(), outerNames, shadowed);
+            }
+            case WhileStmt ws ->
+                findShadowedNames(ws.body(), outerNames, shadowed);
+            default -> {}
+        }
+    }
+
+    private void collectBlockDeclNames(Stmt stmt, Set<String> names) {
+        switch (stmt) {
+            case Block b -> {
+                for (Stmt s : b.stmts()) collectBlockDeclNames(s, names);
+            }
+            case VarDecl vd -> names.add(vd.name());
+            case ConstDecl cd -> names.add(cd.name());
+            default -> {}
+        }
+    }
+
+    /** Collect names declared locally in a statement subtree. */
+    private void collectLocalNames(Stmt stmt, Set<String> names) {
+        switch (stmt) {
+            case Block b -> {
+                for (Stmt s : b.stmts()) collectLocalNames(s, names);
+            }
+            case VarDecl vd -> names.add(vd.name());
+            case ConstDecl cd -> names.add(cd.name());
+            case IfStmt is -> {
+                collectLocalNames(is.thenStmt(), names);
+                if (is.elseStmt() != null) collectLocalNames(is.elseStmt(), names);
+            }
+            case WhileStmt ws -> collectLocalNames(ws.body(), names);
+            default -> {}
+        }
     }
 
     /** Count variable reads in a statement subtree. */
@@ -895,6 +990,13 @@ public class CodeGenerator {
             }
             if (paramIdx >= 0 && paramIdx < 8) {
                 emit("mv", r, "a" + paramIdx);
+            } else if (paramIdx >= 8 && frameSize > 0) {
+                // Parameter 8+ arrives on the caller's outgoing arg area.
+                // The caller stored extra args at old_sp + (i-8)*4.
+                // After our prologue (addi sp,sp,-frameSize),
+                // those are at sp + frameSize + (i-8)*4.
+                int callerOffset = frameSize + (paramIdx - 8) * 4;
+                emit("lw", r, callerOffset + "(sp)");
             } else {
                 emit("li", r, "0"); // fallback (should not happen)
             }
@@ -1429,16 +1531,9 @@ public class CodeGenerator {
         }
         // At this point all temp registers should be free.
 
-        // Load back spilled extra args (plenty of free regs now)
-        for (int i = 8; i < numArgs; i++) {
-            if (argSpills[i] != -1) {
-                argRegs[i] = loadSpill(argSpills[i]);
-                freeSpillSlot(argSpills[i]);
-                argSpills[i] = -1;
-            }
-        }
-
-        // Set up outgoing-arg area on stack for args beyond 8
+        // Store extra args (beyond 8) into the outgoing-arg area.
+        // Interleave loading spilled values and storing to avoid
+        // register exhaustion when there are many spilled extra args.
         int extraAlignedSize = 0;
         if (extraArgs > 0) {
             int extraSize = extraArgs * 4;
@@ -1446,12 +1541,23 @@ public class CodeGenerator {
             emit("addi", "sp", "sp", String.valueOf(-extraAlignedSize));
 
             for (int i = 8; i < numArgs; i++) {
+                String reg;
                 if (argRegs[i] != null) {
-                    int offset = (i - 8) * 4;
-                    emit("sw", argRegs[i], offset + "(sp)");
-                    freeReg(argRegs[i]);
-                    argRegs[i] = null;
+                    // Already in a temp register.
+                    reg = argRegs[i];
+                } else if (argSpills[i] != -1) {
+                    // Value was spilled — load it now.
+                    reg = allocReg();
+                    emit("lw", reg, argSpills[i] + "(s0)");
+                    freeSpillSlot(argSpills[i]);
+                    argSpills[i] = -1;
+                } else {
+                    continue;
                 }
+                int offset = (i - 8) * 4;
+                emit("sw", reg, offset + "(sp)");
+                freeReg(reg);
+                argRegs[i] = null;
             }
         }
 
@@ -1539,20 +1645,17 @@ public class CodeGenerator {
         for (int i = 0; i < NUM_TEMPS; i++) {
             if (!tempUsed[i]) {
                 tempUsed[i] = true;
-                // This register is being reused — any last-store value is gone
                 regValid.remove(TEMP_REGS[i]);
                 return TEMP_REGS[i];
             }
         }
         // All temp registers are in use. Try to steal one from the
         // last-store cache (optimization). These registers hold values
-        // already stored to memory, so stealing them is safe — the
-        // next read will just use lw instead.
+        // already stored to memory, so stealing them is safe.
         if (optimize) {
             for (int i = 0; i < NUM_TEMPS; i++) {
                 String reg = TEMP_REGS[i];
                 if (regValid.contains(reg)) {
-                    // Find which variable this register was cached for
                     String varName = null;
                     for (var e : lastStoreReg.entrySet()) {
                         if (e.getValue().equals(reg)) {
@@ -1587,8 +1690,9 @@ public class CodeGenerator {
                 return allocReg();
             }
 
-            // Last resort: evict a dirty s-register variable.
-            // Write it back to its stack slot and reuse the s-reg as a temp.
+            // Last resort: spill a dirty s-reg variable to stack.
+            // Write back to its local slot, then remove from cache
+            // so its s-reg can be reused as a temp.
             if (!sRegDirty.isEmpty()) {
                 String varName = sRegDirty.iterator().next();
                 String sReg = varToSReg.get(varName);
@@ -1598,24 +1702,34 @@ public class CodeGenerator {
                         emit("sw", sReg, off + "(s0)");
                     }
                     sRegDirty.remove(varName);
-                    // Remove from cache so future reads hit the stack.
                     varToSReg.remove(varName);
                     sRegToVar.remove(sReg);
+                    // Reuse this s-reg as a temp. Mark it as "in use"
+                    // by treating it like an allocated register. The
+                    // caller must free it via freeReg, which will
+                    // no-op for s-regs. This is a one-shot use:
+                    // after freeReg no-ops, future allocReg calls
+                    // won't find this s-reg (it's no longer in
+                    // varToSReg or tempUsed). To avoid leaking it,
+                    // we add it back to the free pool via a special
+                    // tracking set.
+                    leakedSRegs.add(sReg);
                     return sReg;
                 }
             }
-            // If we have any clean s-reg variable, steal its register.
-            for (var e : varToSReg.entrySet()) {
-                if (!sRegDirty.contains(e.getKey())) {
-                    String sReg = e.getValue();
-                    varToSReg.remove(e.getKey());
-                    sRegToVar.remove(sReg);
-                    return sReg;
-                }
+            // Reuse a previously-leaked s-reg if available.
+            if (!leakedSRegs.isEmpty()) {
+                String sReg = leakedSRegs.iterator().next();
+                leakedSRegs.remove(sReg);
+                return sReg;
             }
         }
         throw new RuntimeException("out of temporary registers");
     }
+
+    // Track s-registers that were evicted from var-cache and used as temps.
+    // They can be reused by future allocReg calls when t-regs are exhausted.
+    private final Set<String> leakedSRegs = new HashSet<>();
 
     /** Get the index of a temp register (0-6). */
     private int regIndex(String reg) {
@@ -1633,19 +1747,17 @@ public class CodeGenerator {
     }
 
     private void freeReg(String reg) {
-        // Handle s-registers that were stolen as temps.
+        // s-registers: if this was a leaked/stolen s-reg, recycle it.
         if (reg.startsWith("s")) {
-            // This was an s-register used as a temp. Just return — it's
-            // not tracked in tempUsed, and its original variable mapping
-            // was already cleared when stolen.
+            if (optimize) {
+                leakedSRegs.add(reg);
+            }
             return;
         }
         for (int i = 0; i < NUM_TEMPS; i++) {
             if (TEMP_REGS[i].equals(reg)) {
                 tempUsed[i] = false;
-                // This register is being freed — any last-store value is gone
                 regValid.remove(reg);
-                // If this register was cached for a variable, invalidate
                 if (optimize) {
                     String var = regToVar.remove(reg);
                     if (var != null) {

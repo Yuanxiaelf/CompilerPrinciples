@@ -143,11 +143,23 @@ public class CodeGenerator {
             if (countAstNodes(compUnit) > INTERPRETER_MAX_AST_NODES) {
                 return null;
             }
+            if (containsTailRecursiveFunction(compUnit)) {
+                return null;
+            }
             ConstInterpreter interpreter = new ConstInterpreter(compUnit);
             return interpreter.runMain();
         } catch (ConstEvalBailout | ArithmeticException | StackOverflowError ignored) {
             return null;
         }
+    }
+
+    private boolean containsTailRecursiveFunction(CompUnit compUnit) {
+        for (ASTNode item : compUnit.items()) {
+            if (item instanceof FuncDef fd && containsTailRecursiveReturn(fd.body(), fd.name())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private int countAstNodes(ASTNode node) {
@@ -304,7 +316,10 @@ public class CodeGenerator {
         private boolean exprIsPureForMemo(Expr expr, Set<String> visiting) {
             return switch (expr) {
                 case LiteralExpr ignored -> true;
-                case IdExpr ignored -> true;
+                case IdExpr id -> {
+                    Symbol sym = analyzer.getIdSymbols().get(id);
+                    yield sym == null || sym.isConst() || !sym.isGlobal();
+                }
                 case UnaryExpr ue -> exprIsPureForMemo(ue.operand(), visiting);
                 case BinaryExpr be -> exprIsPureForMemo(be.left(), visiting)
                         && exprIsPureForMemo(be.right(), visiting);
@@ -591,6 +606,7 @@ public class CodeGenerator {
         }
 
         private CountAndSum countModuloMatches(int start, int step, long iterations, BulkModuloCond cond) {
+            if (start < 0 || step <= 0) throw new ConstEvalBailout();
             long count = 0;
             long sum = 0;
             int modulus = cond.modulus;

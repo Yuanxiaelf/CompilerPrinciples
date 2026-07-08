@@ -163,7 +163,9 @@ public class CodeGenerator {
         // For safety, only cache variables in leaf functions (no calls).
         // Functions with calls have complex register interactions that
         // require more thorough liveness analysis to cache safely.
-        if (optimize) {
+        // FIXME: s-reg caching temporarily disabled for debugging.
+        // Enable with: if (optimize) {
+        if (false) {
             Map<String, Integer> varUseCounts = new HashMap<>();
             countVarReads(fd.body(), varUseCounts);
 

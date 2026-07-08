@@ -1059,13 +1059,56 @@ public class CodeGenerator {
             resultReg = leftReg;
         }
 
-        // Strength reduction: use immediate instructions when possible
+        // Safe algebraic optimizations (post-evaluation).
+        // Right-side literal identities:
         if (optimize && be.right() instanceof LiteralExpr rle) {
             int imm = rle.value();
-            if (tryEmitImmOp(be.op(), resultReg, resultReg, imm)) {
-                freeReg(rightReg);
-                return resultReg;
+            boolean handled = false;
+            switch (be.op()) {
+                case "+" -> { if (imm == 0) handled = true; }
+                case "-" -> { if (imm == 0) handled = true; }
+                case "*" -> {
+                    if (imm == 0) {
+                        emit("mv", resultReg, "zero");
+                        handled = true;
+                    } else if (imm == 1) {
+                        handled = true;
+                    } else if ((imm & (imm - 1)) == 0 && imm > 0) {
+                        int shift = Integer.numberOfTrailingZeros(imm);
+                        emit("slli", resultReg, resultReg, String.valueOf(shift));
+                        handled = true;
+                    }
+                }
+                case "/" -> { if (imm == 1) handled = true; }
+                case "%" -> { if (imm == 1) { emit("mv", resultReg, "zero"); handled = true; } }
             }
+            if (handled) { freeReg(rightReg); return resultReg; }
+            if (tryEmitImmOp(be.op(), resultReg, resultReg, imm)) {
+                freeReg(rightReg); return resultReg;
+            }
+        }
+        // Left-side literal commutative identities:
+        if (optimize && be.left() instanceof LiteralExpr lle) {
+            int imm = lle.value();
+            boolean handled = false;
+            switch (be.op()) {
+                case "+" -> { if (imm == 0) { freeReg(resultReg); return rightReg; } }
+                case "*" -> {
+                    if (imm == 0) {
+                        emit("mv", resultReg, "zero");
+                        handled = true;
+                    } else if (imm == 1) {
+                        freeReg(resultReg); return rightReg;
+                    }
+                }
+                case "-" -> {
+                    if (imm == 0) {
+                        emit("sub", resultReg, "zero", rightReg);
+                        handled = true;
+                    }
+                }
+            }
+            if (handled) { freeReg(rightReg); return resultReg; }
         }
 
         // resultReg holds left value; apply operator with rightReg

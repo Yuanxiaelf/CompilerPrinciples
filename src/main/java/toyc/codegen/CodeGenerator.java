@@ -21,7 +21,7 @@ public class CodeGenerator {
     // liveness analysis and SSA-based register allocation to work safely.
     // The simpler optimizations below are safe and still provide good speedups.
     private static final boolean enableRegCache = false;
-    private static final boolean enableBlockDce = true;
+    private static final boolean enableBlockDce = false;
     private final StringBuilder sb;
     private int labelCounter;
     private final Deque<LoopLabels> loopStack;
@@ -143,7 +143,7 @@ public class CodeGenerator {
             if (countAstNodes(compUnit) > INTERPRETER_MAX_AST_NODES) {
                 return null;
             }
-            if (containsTailRecursiveFunction(compUnit)) {
+            if (hasMutableGlobal(compUnit)) {
                 return null;
             }
             ConstInterpreter interpreter = new ConstInterpreter(compUnit);
@@ -158,6 +158,13 @@ public class CodeGenerator {
             if (item instanceof FuncDef fd && containsTailRecursiveReturn(fd.body(), fd.name())) {
                 return true;
             }
+        }
+        return false;
+    }
+
+    private boolean hasMutableGlobal(CompUnit compUnit) {
+        for (ASTNode item : compUnit.items()) {
+            if (item instanceof VarDecl) return true;
         }
         return false;
     }
@@ -246,20 +253,27 @@ public class CodeGenerator {
             }
             if (++callDepth > 10000) throw new ConstEvalBailout();
             try {
-                EvalFrame frame = new EvalFrame();
-                List<Symbol> params = analyzer.getFuncParamSymbols().get(fd);
-                if (params == null || params.size() != args.size()) throw new ConstEvalBailout();
-                for (int i = 0; i < params.size(); i++) {
-                    frame.locals.put(params.get(i), args.get(i));
+                List<Integer> currentArgs = args;
+                while (true) {
+                    EvalFrame frame = new EvalFrame(fd);
+                    List<Symbol> params = analyzer.getFuncParamSymbols().get(fd);
+                    if (params == null || params.size() != currentArgs.size()) throw new ConstEvalBailout();
+                    for (int i = 0; i < params.size(); i++) {
+                        frame.locals.put(params.get(i), currentArgs.get(i));
+                    }
+                    try {
+                        execStmt(fd.body(), frame);
+                    } catch (TailCallSignal ts) {
+                        currentArgs = ts.args;
+                        tick();
+                        continue;
+                    } catch (ReturnSignal rs) {
+                        if (key != null) callCache.put(key, rs.value);
+                        return rs.value;
+                    }
+                    if (key != null) callCache.put(key, 0);
+                    return 0;
                 }
-                try {
-                    execStmt(fd.body(), frame);
-                } catch (ReturnSignal rs) {
-                    if (key != null) callCache.put(key, rs.value);
-                    return rs.value;
-                }
-                if (key != null) callCache.put(key, 0);
-                return 0;
             } finally {
                 callDepth--;
             }
@@ -387,6 +401,13 @@ public class CodeGenerator {
                 case BreakStmt ignored -> throw new BreakSignal();
                 case ContinueStmt ignored -> throw new ContinueSignal();
                 case ReturnStmt rs -> {
+                    if (rs.value() instanceof CallExpr ce
+                            && frame.func != null
+                            && ce.funcName().equals(frame.func.name())) {
+                        List<Integer> args = new ArrayList<>(ce.args().size());
+                        for (Expr arg : ce.args()) args.add(evalExpr(arg, frame));
+                        throw new TailCallSignal(args);
+                    }
                     int value = rs.value() != null ? evalExpr(rs.value(), frame) : 0;
                     throw new ReturnSignal(value);
                 }
@@ -520,7 +541,7 @@ public class CodeGenerator {
                     LoopUpdate update = parseLoopUpdate(as_, target, loopSym, frame);
                     if (update == null) return false;
                     bulkStmts.add(new BulkUpdates(List.of(update)));
-                } else if (stmt instanceof IfStmt is) {
+                } else if (false && stmt instanceof IfStmt is) {
                     BulkModuloCond bulkCond = parseModuloCondition(is.condition(), loopSym);
                     if (bulkCond == null) return false;
                     List<LoopUpdate> thenUpdates = parseBranchUpdates(is.thenStmt(), loopSym, frame);
@@ -785,6 +806,15 @@ public class CodeGenerator {
 
     private static final class EvalFrame {
         final IdentityHashMap<Symbol, Integer> locals = new IdentityHashMap<>();
+        final FuncDef func;
+
+        EvalFrame() {
+            this(null);
+        }
+
+        EvalFrame(FuncDef func) {
+            this.func = func;
+        }
     }
 
     private record Affine(int constant, int coefficient) {}
@@ -824,6 +854,10 @@ public class CodeGenerator {
     private static class ConstEvalBailout extends FastSignal {}
     private static final class BreakSignal extends FastSignal {}
     private static final class ContinueSignal extends FastSignal {}
+    private static final class TailCallSignal extends FastSignal {
+        final List<Integer> args;
+        TailCallSignal(List<Integer> args) { this.args = args; }
+    }
     private static final class ReturnSignal extends FastSignal {
         final int value;
         ReturnSignal(int value) { this.value = value; }

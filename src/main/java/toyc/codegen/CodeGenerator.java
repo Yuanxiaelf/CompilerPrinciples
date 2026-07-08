@@ -160,7 +160,10 @@ public class CodeGenerator {
         // ---- Variable-to-s-register assignment (optimization) ----
         // Must happen BEFORE countLocals because s-reg saves affect
         // the local offset starting point.
-        if (optimize) {
+        // For safety, only cache variables in leaf functions (no calls).
+        // Functions with calls have complex register interactions that
+        // require more thorough liveness analysis to cache safely.
+        if (optimize && isLeaf) {
             Map<String, Integer> varUseCounts = new HashMap<>();
             countVarReads(fd.body(), varUseCounts);
 
@@ -1062,10 +1065,6 @@ public class CodeGenerator {
                 case "/" -> { if (imm == 1) handled = true; }
                 case "%" -> {
                     if (imm == 1) { emit("mv", resultReg, "zero"); handled = true; }
-                    else if ((imm & (imm - 1)) == 0 && (imm - 1) <= 2047) {
-                        emit("andi", resultReg, resultReg, String.valueOf(imm - 1));
-                        handled = true;
-                    }
                 }
             }
             if (handled) return resultReg;
@@ -1134,11 +1133,6 @@ public class CodeGenerator {
                     if (imm == 1) {
                         emit("mv", resultReg, "zero");
                         freeReg(rightReg); return resultReg;
-                    }
-                    if ((imm & (imm - 1)) == 0 && (imm - 1) <= 2047) {
-                        emit("andi", resultReg, resultReg, String.valueOf(imm - 1));
-                        freeReg(rightReg);
-                        return resultReg;
                     }
                 }
             }

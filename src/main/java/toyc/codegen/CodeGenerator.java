@@ -604,6 +604,15 @@ public class CodeGenerator {
                 stmts = stmts.subList(1, stmts.size());
             }
 
+            Set<Symbol> assignedInLoop = newIdentitySet();
+            for (Stmt stmt : stmts) collectAssignedSymbols(stmt, assignedInLoop);
+            assignedInLoop.remove(loopSym);
+            if (exprUsesAnySymbol(boundExpr, assignedInLoop, null)) return null;
+            Set<String> assignedNames = new HashSet<>();
+            for (Stmt stmt : stmts) collectAssignedNames(stmt, assignedNames);
+            assignedNames.remove(loopId.name());
+            if (exprUsesAnyName(boundExpr, assignedNames, null)) return null;
+
             int step = 0;
             boolean sawStep = false;
             for (Stmt stmt : stmts) {
@@ -693,6 +702,15 @@ public class CodeGenerator {
             if (ws.body() instanceof Block b) stmts = b.stmts();
             else stmts = List.of(ws.body());
 
+            Set<Symbol> assignedInLoopForBound = newIdentitySet();
+            for (Stmt stmt : stmts) collectAssignedSymbols(stmt, assignedInLoopForBound);
+            assignedInLoopForBound.remove(loopSym);
+            if (exprUsesAnySymbol(boundExpr, assignedInLoopForBound, null)) return false;
+            Set<String> assignedNamesForBound = new HashSet<>();
+            for (Stmt stmt : stmts) collectAssignedNames(stmt, assignedNamesForBound);
+            assignedNamesForBound.remove(loopId.name());
+            if (exprUsesAnyName(boundExpr, assignedNamesForBound, null)) return false;
+
             AssignStmt stepStmt = null;
             int step = 0;
             for (Stmt stmt : stmts) {
@@ -717,28 +735,41 @@ public class CodeGenerator {
             if (iterations < 0) return false;
             if (iterations == 0) return true;
 
+            Set<Symbol> assignedInLoop = newIdentitySet();
+            for (Stmt stmt : stmts) collectAssignedSymbols(stmt, assignedInLoop);
+            assignedInLoop.remove(loopSym);
+
             List<BulkLoopStmt> bulkStmts = new ArrayList<>();
             Set<Symbol> cumulativeUpdates = newIdentitySet();
             for (Stmt stmt : stmts) {
                 if (stmt instanceof AssignStmt as_) {
                     Symbol target = analyzer.getAssignSymbols().get(as_);
                     if (target == loopSym) continue;
+                    if (exprUsesAnySymbol(as_.value(), assignedInLoop, target)) return false;
                     if (exprUsesAnySymbol(as_.value(), cumulativeUpdates, target)) return false;
                     LoopUpdate update = parseLoopUpdate(as_, target, loopSym, frame);
                     if (update == null) return false;
                     bulkStmts.add(new BulkUpdates(List.of(update)));
                     cumulativeUpdates.add(target);
                 } else if (stmt instanceof IfStmt is) {
+                    if (exprUsesAnySymbol(is.condition(), assignedInLoop, null)) return false;
                     if (exprUsesAnySymbol(is.condition(), cumulativeUpdates, null)) return false;
+                    Set<Symbol> branchAssigned = newIdentitySet();
+                    collectAssignedSymbols(is.thenStmt(), branchAssigned);
+                    if (is.elseStmt() != null) collectAssignedSymbols(is.elseStmt(), branchAssigned);
+                    for (Symbol sym : branchAssigned) {
+                        if (cumulativeUpdates.contains(sym)) return false;
+                    }
                     BulkCond bulkCond = parseBulkCondition(is.condition(), loopSym, frame);
                     if (bulkCond == null) return false;
-                    List<LoopUpdate> thenUpdates = parseBranchUpdates(is.thenStmt(), loopSym, frame);
+                    List<LoopUpdate> thenUpdates = parseBranchUpdates(is.thenStmt(), loopSym, frame, assignedInLoop);
                     if (thenUpdates == null) return false;
                     List<LoopUpdate> elseUpdates = is.elseStmt() != null
-                            ? parseBranchUpdates(is.elseStmt(), loopSym, frame)
+                            ? parseBranchUpdates(is.elseStmt(), loopSym, frame, assignedInLoop)
                             : List.of();
                     if (elseUpdates == null) return false;
                     bulkStmts.add(new BulkIf(bulkCond, thenUpdates, elseUpdates));
+                    cumulativeUpdates.addAll(branchAssigned);
                 } else {
                     return false;
                 }
@@ -784,7 +815,8 @@ public class CodeGenerator {
             }
         }
 
-        private List<LoopUpdate> parseBranchUpdates(Stmt stmt, Symbol loopSym, EvalFrame frame) {
+        private List<LoopUpdate> parseBranchUpdates(Stmt stmt, Symbol loopSym, EvalFrame frame,
+                                                    Set<Symbol> assignedInLoop) {
             List<Stmt> branchStmts;
             if (stmt instanceof Block b) branchStmts = b.stmts();
             else branchStmts = List.of(stmt);
@@ -795,6 +827,7 @@ public class CodeGenerator {
                 if (!(s instanceof AssignStmt as_)) return null;
                 Symbol target = analyzer.getAssignSymbols().get(as_);
                 if (target == null || target == loopSym) return null;
+                if (exprUsesAnySymbol(as_.value(), assignedInLoop, target)) return null;
                 if (exprUsesAnySymbol(as_.value(), cumulativeUpdates, target)) return null;
                 LoopUpdate update = parseLoopUpdate(as_, target, loopSym, frame);
                 if (update == null) return null;
@@ -871,19 +904,29 @@ public class CodeGenerator {
             long count = 0;
             long sum = 0;
             int modulus = cond.modulus;
+            int period = modulus / gcd(Math.abs(step), modulus);
             int wanted = Math.floorMod(cond.remainder, modulus);
-            for (int k = 0; k < modulus && k < iterations; k++) {
+            for (int k = 0; k < period && k < iterations; k++) {
                 int value = start + k * step;
                 boolean match = Math.floorMod(value, modulus) == wanted;
                 if (cond.negate) match = !match;
                 if (!match) continue;
-                long c = 1L + (iterations - 1L - k) / modulus;
+                long c = 1L + (iterations - 1L - k) / period;
                 long first = start + (long) k * step;
-                long stride = (long) modulus * step;
+                long stride = (long) period * step;
                 count += c;
                 sum += c * (2L * first + (c - 1L) * stride) / 2L;
             }
             return new CountAndSum(count, sum);
+        }
+
+        private int gcd(int a, int b) {
+            while (b != 0) {
+                int t = a % b;
+                a = b;
+                b = t;
+            }
+            return a;
         }
 
         private CountAndSum countRelMatches(int start, int step, long iterations, BulkRelCond cond) {
@@ -1314,6 +1357,44 @@ public class CodeGenerator {
                     boolean found = false;
                     for (Expr arg : ce.args()) {
                         if (exprUsesAnySymbol(arg, symbols, ignored)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    yield found;
+                }
+                default -> false;
+            };
+        }
+
+        private void collectAssignedNames(Stmt stmt, Set<String> out) {
+            switch (stmt) {
+                case Block b -> {
+                    for (Stmt s : b.stmts()) collectAssignedNames(s, out);
+                }
+                case AssignStmt as_ -> out.add(as_.name());
+                case VarDecl vd -> out.add(vd.name());
+                case ConstDecl cd -> out.add(cd.name());
+                case IfStmt is -> {
+                    collectAssignedNames(is.thenStmt(), out);
+                    if (is.elseStmt() != null) collectAssignedNames(is.elseStmt(), out);
+                }
+                case WhileStmt ws -> collectAssignedNames(ws.body(), out);
+                default -> {}
+            }
+        }
+
+        private boolean exprUsesAnyName(Expr expr, Set<String> names, String ignored) {
+            if (names.isEmpty()) return false;
+            return switch (expr) {
+                case IdExpr id -> !id.name().equals(ignored) && names.contains(id.name());
+                case BinaryExpr be -> exprUsesAnyName(be.left(), names, ignored)
+                        || exprUsesAnyName(be.right(), names, ignored);
+                case UnaryExpr ue -> exprUsesAnyName(ue.operand(), names, ignored);
+                case CallExpr ce -> {
+                    boolean found = false;
+                    for (Expr arg : ce.args()) {
+                        if (exprUsesAnyName(arg, names, ignored)) {
                             found = true;
                             break;
                         }
@@ -2380,12 +2461,6 @@ public class CodeGenerator {
                 String savedReg = symbolRegs.get(sym);
                 if (savedReg != null) {
                     return new BranchOperand(savedReg, false);
-                }
-                if (optimize) {
-                    String lsReg = lastStoreReg.get(id.name());
-                    if (lsReg != null && regValid.contains(lsReg)) {
-                        return new BranchOperand(lsReg, false);
-                    }
                 }
             }
         }

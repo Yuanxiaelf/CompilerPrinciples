@@ -713,6 +713,12 @@ public class CodeGenerator {
             }
             if (paramIdx >= 0 && paramIdx < 8) {
                 emit("mv", r, "a" + paramIdx);
+            } else if (paramIdx >= 8 && frameSize > 0) {
+                // Parameter 8+ arrives on the caller's outgoing arg area.
+                // After our prologue (addi sp,sp,-frameSize), extra args
+                // are at sp + frameSize + (paramIdx-8)*4.
+                int callerOff = frameSize + (paramIdx - 8) * 4;
+                emit("lw", r, callerOff + "(sp)");
             } else {
                 emit("li", r, "0"); // fallback (should not happen)
             }

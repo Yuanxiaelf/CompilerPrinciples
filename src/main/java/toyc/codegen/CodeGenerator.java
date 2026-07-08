@@ -23,8 +23,10 @@ public class CodeGenerator {
     private static final boolean enableRegCache = false;
     private static final boolean enableBlockDce = false;
     private static final boolean enableInterpreterBranchBulk = false;
-    private static final boolean enableGlobalAddrCache = true;
-    private static final boolean enableSmallFunctionInline = true;
+    private static final boolean enableGlobalAddrCache = false;
+    private static final boolean enableSmallFunctionInline = false;
+    private static final boolean enableWhileConstHoist = false;
+    private static final boolean enableCompareImmBranch = false;
     private final StringBuilder sb;
     private int labelCounter;
     private final Deque<LoopLabels> loopStack;
@@ -2318,7 +2320,7 @@ public class CodeGenerator {
     }
 
     private HoistedWhileConst tryHoistWhileConst(WhileStmt ws) {
-        if (!optimize || stmtContainsCall(ws.body())) return null;
+        if (!optimize || !enableWhileConstHoist || stmtContainsCall(ws.body())) return null;
         if (!(ws.condition() instanceof BinaryExpr be) || !isCompareOp(be.op())) return null;
         Integer right = literalOrConstValue(be.right());
         if (right != null && !isImm12(right) && !exprContainsCall(be.left())) {
@@ -2461,7 +2463,7 @@ public class CodeGenerator {
     }
 
     private void emitCompareBranch(String op, boolean branchOnTrue, Expr left, Expr right, String label) {
-        if (tryEmitCompareImmBranch(op, branchOnTrue, left, right, label)) {
+        if (enableCompareImmBranch && tryEmitCompareImmBranch(op, branchOnTrue, left, right, label)) {
             return;
         }
         BranchOperand lOp = branchOperand(left);

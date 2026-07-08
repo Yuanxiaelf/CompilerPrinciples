@@ -23,8 +23,8 @@ public class CodeGenerator {
     private static final boolean enableRegCache = false;
     private static final boolean enableBlockDce = false;
     private static final boolean enableInterpreterBranchBulk = false;
-    private static final boolean enableGlobalAddrCache = false;
-    private static final boolean enableSmallFunctionInline = false;
+    private static final boolean enableGlobalAddrCache = true;
+    private static final boolean enableSmallFunctionInline = true;
     private final StringBuilder sb;
     private int labelCounter;
     private final Deque<LoopLabels> loopStack;
@@ -76,6 +76,7 @@ public class CodeGenerator {
     // Loop labels
     private record LoopLabels(String start, String end) {}
     private record BranchOperand(String reg, boolean owned) {}
+    private record HoistedWhileConst(BinaryExpr condition, boolean literalOnRight, String reg) {}
 
     public CodeGenerator(SemanticAnalyzer analyzer, boolean optimize) {
         this.analyzer = analyzer;
@@ -2168,6 +2169,8 @@ public class CodeGenerator {
                             emit("sw", r, "0(" + addrReg + ")");
                             freeReg(addrReg);
                         }
+                        freeReg(r);
+                        return;
                     } else {
                         // Parameter or other local not yet allocated
                         int offset = getLocalOffset(as_.name());
@@ -2293,8 +2296,13 @@ public class CodeGenerator {
 
         loopStack.push(new LoopLabels(startLabel, endLabel));
 
+        HoistedWhileConst hoisted = tryHoistWhileConst(ws);
         emitLabel(startLabel);
-        genBranchIfFalse(ws.condition(), endLabel);
+        if (hoisted != null) {
+            genBranchIfFalseHoisted(hoisted, endLabel);
+        } else {
+            genBranchIfFalse(ws.condition(), endLabel);
+        }
 
         emitLabel(bodyLabel);
         codegenLoopDepth++;
@@ -2303,7 +2311,46 @@ public class CodeGenerator {
         emit("j", startLabel);
 
         emitLabel(endLabel);
+        if (hoisted != null) {
+            freeReg(hoisted.reg);
+        }
         loopStack.pop();
+    }
+
+    private HoistedWhileConst tryHoistWhileConst(WhileStmt ws) {
+        if (!optimize || stmtContainsCall(ws.body())) return null;
+        if (!(ws.condition() instanceof BinaryExpr be) || !isCompareOp(be.op())) return null;
+        Integer right = literalOrConstValue(be.right());
+        if (right != null && !isImm12(right) && !exprContainsCall(be.left())) {
+            String r = allocReg();
+            emit("li", r, String.valueOf(right));
+            return new HoistedWhileConst(be, true, r);
+        }
+        Integer left = literalOrConstValue(be.left());
+        if (left != null && !isImm12(left) && !exprContainsCall(be.right())) {
+            String r = allocReg();
+            emit("li", r, String.valueOf(left));
+            return new HoistedWhileConst(be, false, r);
+        }
+        return null;
+    }
+
+    private void genBranchIfFalseHoisted(HoistedWhileConst hoisted, String label) {
+        BinaryExpr be = hoisted.condition;
+        BranchOperand other = branchOperand(hoisted.literalOnRight ? be.left() : be.right());
+        String l = hoisted.literalOnRight ? other.reg : hoisted.reg;
+        String r = hoisted.literalOnRight ? hoisted.reg : other.reg;
+
+        switch (be.op()) {
+            case "==" -> emit("bne", l, r, label);
+            case "!=" -> emit("beq", l, r, label);
+            case "<" -> emit("bge", l, r, label);
+            case ">" -> emit("bge", r, l, label);
+            case "<=" -> emit("blt", r, l, label);
+            case ">=" -> emit("blt", l, r, label);
+            default -> {}
+        }
+        freeBranchOperand(other);
     }
 
     private void genReturn(ReturnStmt rs) {
@@ -2402,7 +2449,21 @@ public class CodeGenerator {
                 || ">".equals(op) || "<=".equals(op) || ">=".equals(op);
     }
 
+    private String flipCompareOp(String op) {
+        return switch (op) {
+            case "<" -> ">";
+            case "<=" -> ">=";
+            case ">" -> "<";
+            case ">=" -> "<=";
+            case "==", "!=" -> op;
+            default -> null;
+        };
+    }
+
     private void emitCompareBranch(String op, boolean branchOnTrue, Expr left, Expr right, String label) {
+        if (tryEmitCompareImmBranch(op, branchOnTrue, left, right, label)) {
+            return;
+        }
         BranchOperand lOp = branchOperand(left);
         BranchOperand rOp = branchOperand(right);
         String l = lOp.reg;
@@ -2432,6 +2493,92 @@ public class CodeGenerator {
 
         freeBranchOperand(rOp);
         freeBranchOperand(lOp);
+    }
+
+    private boolean tryEmitCompareImmBranch(String op, boolean branchOnTrue,
+                                            Expr left, Expr right, String label) {
+        Integer imm = literalOrConstValue(right);
+        Expr valueExpr = left;
+        String cmpOp = op;
+        if (imm == null) {
+            imm = literalOrConstValue(left);
+            valueExpr = right;
+            cmpOp = flipCompareOp(op);
+        }
+        if (imm == null || cmpOp == null || exprContainsCall(valueExpr)) return false;
+
+        BranchOperand value = branchOperand(valueExpr);
+        String result = value.owned ? value.reg : allocReg();
+        if (!emitCompareImm(result, value.reg, cmpOp, imm)) {
+            if (!value.owned) freeReg(result);
+            freeBranchOperand(value);
+            return false;
+        }
+        emit(branchOnTrue ? "bnez" : "beqz", result, label);
+        if (!value.owned) freeReg(result);
+        else freeReg(result);
+        return true;
+    }
+
+    private boolean emitCompareImm(String rd, String rs, String op, int imm) {
+        switch (op) {
+            case "<" -> {
+                if (!isImm12(imm)) return false;
+                emit("slti", rd, rs, String.valueOf(imm));
+                return true;
+            }
+            case ">=" -> {
+                if (!isImm12(imm)) return false;
+                emit("slti", rd, rs, String.valueOf(imm));
+                emit("xori", rd, rd, "1");
+                return true;
+            }
+            case "<=" -> {
+                if (imm == Integer.MAX_VALUE || !isImm12(imm + 1)) return false;
+                emit("slti", rd, rs, String.valueOf(imm + 1));
+                return true;
+            }
+            case ">" -> {
+                if (imm == Integer.MAX_VALUE || !isImm12(imm + 1)) return false;
+                emit("slti", rd, rs, String.valueOf(imm + 1));
+                emit("xori", rd, rd, "1");
+                return true;
+            }
+            case "==" -> {
+                if (imm == 0) {
+                    emit("seqz", rd, rs);
+                    return true;
+                }
+                if (!isImm12(-imm)) return false;
+                emit("addi", rd, rs, String.valueOf(-imm));
+                emit("seqz", rd, rd);
+                return true;
+            }
+            case "!=" -> {
+                if (imm == 0) {
+                    emit("snez", rd, rs);
+                    return true;
+                }
+                if (!isImm12(-imm)) return false;
+                emit("addi", rd, rs, String.valueOf(-imm));
+                emit("snez", rd, rd);
+                return true;
+            }
+            default -> {
+                return false;
+            }
+        }
+    }
+
+    private Integer literalOrConstValue(Expr expr) {
+        if (expr instanceof LiteralExpr le) return le.value();
+        if (expr instanceof IdExpr id) {
+            Symbol sym = analyzer.getIdSymbols().get(id);
+            if (sym != null && sym.isConst() && sym.getConstValue() != null) {
+                return sym.getConstValue();
+            }
+        }
+        return null;
     }
 
     private BranchOperand branchOperand(Expr expr) {

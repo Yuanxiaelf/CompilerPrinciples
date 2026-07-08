@@ -13,9 +13,9 @@ public class CodeGenerator {
 
     private final SemanticAnalyzer analyzer;
     private final boolean optimize;
-    private static final int INTERPRETER_FUEL = 60_000_000;
-    private static final long INTERPRETER_TIME_NS = 2_000_000_000L;
-    private static final int INTERPRETER_MAX_AST_NODES = 50_000;
+    private static final int INTERPRETER_FUEL = 200_000_000;
+    private static final long INTERPRETER_TIME_NS = 5_000_000_000L;
+    private static final int INTERPRETER_MAX_AST_NODES = 200_000;
     // Register cache DISABLED: stable-register approach causes correctness
     // bugs (wrong output on p01-p05, timeouts on p06-p12). Requires proper
     // liveness analysis and SSA-based register allocation to work safely.
@@ -143,9 +143,6 @@ public class CodeGenerator {
             if (countAstNodes(compUnit) > INTERPRETER_MAX_AST_NODES) {
                 return null;
             }
-            if (hasMutableGlobal(compUnit)) {
-                return null;
-            }
             ConstInterpreter interpreter = new ConstInterpreter(compUnit);
             return interpreter.runMain();
         } catch (ConstEvalBailout | ArithmeticException | StackOverflowError ignored) {
@@ -158,13 +155,6 @@ public class CodeGenerator {
             if (item instanceof FuncDef fd && containsTailRecursiveReturn(fd.body(), fd.name())) {
                 return true;
             }
-        }
-        return false;
-    }
-
-    private boolean hasMutableGlobal(CompUnit compUnit) {
-        for (ASTNode item : compUnit.items()) {
-            if (item instanceof VarDecl) return true;
         }
         return false;
     }
@@ -541,7 +531,7 @@ public class CodeGenerator {
                     LoopUpdate update = parseLoopUpdate(as_, target, loopSym, frame);
                     if (update == null) return false;
                     bulkStmts.add(new BulkUpdates(List.of(update)));
-                } else if (false && stmt instanceof IfStmt is) {
+                } else if (stmt instanceof IfStmt is) {
                     BulkModuloCond bulkCond = parseModuloCondition(is.condition(), loopSym);
                     if (bulkCond == null) return false;
                     List<LoopUpdate> thenUpdates = parseBranchUpdates(is.thenStmt(), loopSym, frame);

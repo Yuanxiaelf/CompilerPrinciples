@@ -163,7 +163,7 @@ public class CodeGenerator {
         // For safety, only cache variables in leaf functions (no calls).
         // Functions with calls have complex register interactions that
         // require more thorough liveness analysis to cache safely.
-        if (optimize && isLeaf) {
+        if (optimize) {
             Map<String, Integer> varUseCounts = new HashMap<>();
             countVarReads(fd.body(), varUseCounts);
 
@@ -1148,6 +1148,7 @@ public class CodeGenerator {
             switch (be.op()) {
                 case "+" -> {
                     if (imm == 0) {
+                        if (resultReg != rightReg) freeReg(resultReg);
                         freeReg(leftReg);
                         return rightReg;
                     }
@@ -1159,6 +1160,7 @@ public class CodeGenerator {
                         return resultReg;
                     }
                     if (imm == 1) {
+                        if (resultReg != rightReg) freeReg(resultReg);
                         freeReg(leftReg);
                         return rightReg;
                     }
@@ -1530,8 +1532,12 @@ public class CodeGenerator {
             }
         }
 
-        // Move non-spilled register args from temp regs to a-regs
-        for (int i = 0; i < regArgCount; i++) {
+        // Move non-spilled register args from temp regs to a-regs.
+        // Process in REVERSE order: if a higher-index arg uses an
+        // a-reg as its source (e.g., argRegs[5]="a3"), that a-reg
+        // must be read before a lower-index move overwrites it
+        // (e.g., "mv a3, tX" at i=3).
+        for (int i = regArgCount - 1; i >= 0; i--) {
             if (argRegs[i] != null) {
                 emit("mv", "a" + i, argRegs[i]);
                 freeReg(argRegs[i]);

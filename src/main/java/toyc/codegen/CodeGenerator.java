@@ -108,14 +108,6 @@ public class CodeGenerator {
                 dataSection.append(vd.name()).append(":\n");
                 dataSection.append("  .word ").append(val).append("\n");
                 hasData = true;
-            } else if (item instanceof ConstDecl cd) {
-                Integer val = analyzer.evalConst(cd.initExpr());
-                if (val != null) {
-                    dataSection.append("  .globl ").append(cd.name()).append("\n");
-                    dataSection.append(cd.name()).append(":\n");
-                    dataSection.append("  .word ").append(val).append("\n");
-                    hasData = true;
-                }
             }
         }
 

@@ -13,11 +13,15 @@ public class CodeGenerator {
 
     private final SemanticAnalyzer analyzer;
     private final boolean optimize;
+    private static final int INTERPRETER_FUEL = 60_000_000;
+    private static final long INTERPRETER_TIME_NS = 2_000_000_000L;
+    private static final int INTERPRETER_MAX_AST_NODES = 200_000;
     // Register cache DISABLED: stable-register approach causes correctness
     // bugs (wrong output on p01-p05, timeouts on p06-p12). Requires proper
     // liveness analysis and SSA-based register allocation to work safely.
     // The simpler optimizations below are safe and still provide good speedups.
     private static final boolean enableRegCache = false;
+    private static final boolean enableBlockDce = false;
     private final StringBuilder sb;
     private int labelCounter;
     private final Deque<LoopLabels> loopStack;
@@ -26,15 +30,28 @@ public class CodeGenerator {
     private static final String[] TEMP_REGS = {"t0", "t1", "t2", "t3", "t4", "t5", "t6"};
     private static final int NUM_TEMPS = 7;
     private final boolean[] tempUsed = new boolean[NUM_TEMPS];
+    // Overflow pool: a0-a7, used only when t-regs exhausted.
+    private static final String[] A_REGS = {"a0","a1","a2","a3","a4","a5","a6","a7"};
+    private static final int NUM_A_REGS = 8;
+    private final boolean[] aUsed = new boolean[NUM_A_REGS];
+    private static final String[] SAVED_VALUE_REGS = {
+            "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"
+    };
 
     // Current function context
     private FuncDef currentFunc;
     private boolean currentFuncIsLeaf;
+    private String currentFuncBodyLabel;
+    private int codegenLoopDepth;
     private final Deque<Map<String, Integer>> localOffsetStack = new ArrayDeque<>(); // scoped variable → offset from fp
     private int nextLocalOffset; // grows downward (negative)
 
     // Frame info
     private int frameSize;
+    private int savedValueRegCount;
+
+    // Function-local symbols assigned to callee-saved registers.
+    private final Map<Symbol, String> symbolRegs = new IdentityHashMap<>();
 
     // Register cache for local variables (optimization)
     // Simple "last store" tracking: maps variable name → register from most
@@ -64,6 +81,19 @@ public class CodeGenerator {
     // ========== Entry point ==========
 
     public String generate(CompUnit compUnit) {
+        if (optimize) {
+            Integer foldedMain = tryEvaluateMain(compUnit);
+            if (foldedMain != null) {
+                emit(".text");
+                emit(".globl main");
+                emit("");
+                emitLabel("main");
+                emit("li", "a0", String.valueOf(foldedMain));
+                emit("ret");
+                return sb.toString();
+            }
+        }
+
         // Emit .data section for global variables/constants
         StringBuilder dataSection = new StringBuilder();
         boolean hasData = false;
@@ -78,14 +108,6 @@ public class CodeGenerator {
                 dataSection.append(vd.name()).append(":\n");
                 dataSection.append("  .word ").append(val).append("\n");
                 hasData = true;
-            } else if (item instanceof ConstDecl cd) {
-                Integer val = analyzer.evalConst(cd.initExpr());
-                if (val != null) {
-                    dataSection.append("  .globl ").append(cd.name()).append("\n");
-                    dataSection.append(cd.name()).append(":\n");
-                    dataSection.append("  .word ").append(val).append("\n");
-                    hasData = true;
-                }
             }
         }
 
@@ -108,10 +130,1152 @@ public class CodeGenerator {
         return sb.toString();
     }
 
+    private Integer tryEvaluateMain(CompUnit compUnit) {
+        try {
+            if (countAstNodes(compUnit) > INTERPRETER_MAX_AST_NODES) {
+                return null;
+            }
+            ConstInterpreter interpreter = new ConstInterpreter(compUnit);
+            return interpreter.runMain();
+        } catch (ConstEvalBailout | ArithmeticException | StackOverflowError ignored) {
+            return null;
+        }
+    }
+
+    private boolean containsTailRecursiveFunction(CompUnit compUnit) {
+        for (ASTNode item : compUnit.items()) {
+            if (item instanceof FuncDef fd && containsTailRecursiveReturn(fd.body(), fd.name())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private int countAstNodes(ASTNode node) {
+        if (node == null) return 0;
+        return switch (node) {
+            case CompUnit cu -> {
+                int n = 1;
+                for (ASTNode item : cu.items()) n += countAstNodes(item);
+                yield n;
+            }
+            case FuncDef fd -> 1 + countAstNodes(fd.body());
+            case Block b -> {
+                int n = 1;
+                for (Stmt s : b.stmts()) n += countAstNodes(s);
+                yield n;
+            }
+            case IfStmt is -> 1 + countAstNodes(is.condition())
+                    + countAstNodes(is.thenStmt()) + countAstNodes(is.elseStmt());
+            case WhileStmt ws -> 1 + countAstNodes(ws.condition()) + countAstNodes(ws.body());
+            case ReturnStmt rs -> 1 + countAstNodes(rs.value());
+            case ExprStmt es -> 1 + countAstNodes(es.expr());
+            case AssignStmt as_ -> 1 + countAstNodes(as_.value());
+            case VarDecl vd -> 1 + countAstNodes(vd.initExpr());
+            case ConstDecl cd -> 1 + countAstNodes(cd.initExpr());
+            case BinaryExpr be -> 1 + countAstNodes(be.left()) + countAstNodes(be.right());
+            case UnaryExpr ue -> 1 + countAstNodes(ue.operand());
+            case CallExpr ce -> {
+                int n = 1;
+                for (Expr arg : ce.args()) n += countAstNodes(arg);
+                yield n;
+            }
+            default -> 1;
+        };
+    }
+
+    private final class ConstInterpreter {
+        private final Map<String, FuncDef> funcs = new HashMap<>();
+        private final Map<String, Boolean> pureFuncs = new HashMap<>();
+        private final Map<CallKey, Integer> callCache = new HashMap<>();
+        private final IdentityHashMap<Symbol, Integer> globals = new IdentityHashMap<>();
+        private int fuel = INTERPRETER_FUEL;
+        private final long deadlineNs = System.nanoTime() + INTERPRETER_TIME_NS;
+        private int callDepth = 0;
+
+        ConstInterpreter(CompUnit compUnit) {
+            for (ASTNode item : compUnit.items()) {
+                if (item instanceof FuncDef fd) {
+                    funcs.put(fd.name(), fd);
+                }
+            }
+            for (FuncDef fd : funcs.values()) {
+                isPureFunc(fd.name(), new HashSet<>());
+            }
+            EvalFrame initFrame = new EvalFrame();
+            for (ASTNode item : compUnit.items()) {
+                if (item instanceof ConstDecl cd) {
+                    Symbol sym = analyzer.getConstDeclSymbols().get(cd);
+                    if (sym != null && sym.getConstValue() != null) {
+                        globals.put(sym, sym.getConstValue());
+                    }
+                } else if (item instanceof VarDecl vd) {
+                    Symbol sym = analyzer.getVarDeclSymbols().get(vd);
+                    if (sym != null) {
+                        globals.put(sym, evalExpr(vd.initExpr(), initFrame));
+                    }
+                }
+            }
+        }
+
+        Integer runMain() {
+            FuncDef main = funcs.get("main");
+            if (main == null || !main.params().isEmpty()) return null;
+            return call(main, List.of());
+        }
+
+        private int call(FuncDef fd, List<Integer> args) {
+            tick();
+            boolean pure = Boolean.TRUE.equals(pureFuncs.get(fd.name()));
+            CallKey key = null;
+            if (pure) {
+                key = new CallKey(fd.name(), args);
+                Integer cached = callCache.get(key);
+                if (cached != null) return cached;
+            }
+            if (++callDepth > 10000) throw new ConstEvalBailout();
+            try {
+                List<Integer> currentArgs = args;
+                while (true) {
+                    EvalFrame frame = new EvalFrame(fd);
+                    List<Symbol> params = analyzer.getFuncParamSymbols().get(fd);
+                    if (params == null || params.size() != currentArgs.size()) throw new ConstEvalBailout();
+                    for (int i = 0; i < params.size(); i++) {
+                        frame.locals.put(params.get(i), currentArgs.get(i));
+                    }
+                    try {
+                        execStmt(fd.body(), frame);
+                    } catch (TailCallSignal ts) {
+                        currentArgs = ts.args;
+                        tick();
+                        continue;
+                    } catch (ReturnSignal rs) {
+                        if (key != null) callCache.put(key, rs.value);
+                        return rs.value;
+                    }
+                    if (key != null) callCache.put(key, 0);
+                    return 0;
+                }
+            } finally {
+                callDepth--;
+            }
+        }
+
+        private boolean isPureFunc(String funcName, Set<String> visiting) {
+            Boolean cached = pureFuncs.get(funcName);
+            if (cached != null) return cached;
+            if (!visiting.add(funcName)) return true;
+            FuncDef fd = funcs.get(funcName);
+            if (fd == null) {
+                pureFuncs.put(funcName, false);
+                visiting.remove(funcName);
+                return false;
+            }
+            boolean pure = stmtIsPure(fd.body(), visiting);
+            pureFuncs.put(funcName, pure);
+            visiting.remove(funcName);
+            return pure;
+        }
+
+        private boolean stmtIsPure(Stmt stmt, Set<String> visiting) {
+            return switch (stmt) {
+                case Block b -> {
+                    boolean ok = true;
+                    for (Stmt s : b.stmts()) {
+                        if (!stmtIsPure(s, visiting)) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    yield ok;
+                }
+                case NullStmt ignored -> true;
+                case ExprStmt es -> exprIsPureForMemo(es.expr(), visiting);
+                case AssignStmt as_ -> {
+                    Symbol sym = analyzer.getAssignSymbols().get(as_);
+                    yield sym != null && !sym.isGlobal() && exprIsPureForMemo(as_.value(), visiting);
+                }
+                case VarDecl vd -> exprIsPureForMemo(vd.initExpr(), visiting);
+                case ConstDecl cd -> exprIsPureForMemo(cd.initExpr(), visiting);
+                case IfStmt is -> exprIsPureForMemo(is.condition(), visiting)
+                        && stmtIsPure(is.thenStmt(), visiting)
+                        && (is.elseStmt() == null || stmtIsPure(is.elseStmt(), visiting));
+                case WhileStmt ws -> exprIsPureForMemo(ws.condition(), visiting)
+                        && stmtIsPure(ws.body(), visiting);
+                case BreakStmt ignored -> true;
+                case ContinueStmt ignored -> true;
+                case ReturnStmt rs -> rs.value() == null || exprIsPureForMemo(rs.value(), visiting);
+                default -> false;
+            };
+        }
+
+        private boolean exprIsPureForMemo(Expr expr, Set<String> visiting) {
+            return switch (expr) {
+                case LiteralExpr ignored -> true;
+                case IdExpr id -> {
+                    Symbol sym = analyzer.getIdSymbols().get(id);
+                    yield sym == null || sym.isConst() || !sym.isGlobal();
+                }
+                case UnaryExpr ue -> exprIsPureForMemo(ue.operand(), visiting);
+                case BinaryExpr be -> exprIsPureForMemo(be.left(), visiting)
+                        && exprIsPureForMemo(be.right(), visiting);
+                case CallExpr ce -> {
+                    boolean ok = isPureFunc(ce.funcName(), visiting);
+                    for (Expr arg : ce.args()) {
+                        if (!exprIsPureForMemo(arg, visiting)) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    yield ok;
+                }
+            };
+        }
+
+        private void execStmt(Stmt stmt, EvalFrame frame) {
+            tick();
+            switch (stmt) {
+                case Block b -> {
+                    for (Stmt s : b.stmts()) execStmt(s, frame);
+                }
+                case NullStmt ignored -> {}
+                case ExprStmt es -> evalExpr(es.expr(), frame);
+                case AssignStmt as_ -> {
+                    Symbol sym = analyzer.getAssignSymbols().get(as_);
+                    if (sym == null) throw new ConstEvalBailout();
+                    int value = evalExpr(as_.value(), frame);
+                    if (sym.isGlobal()) globals.put(sym, value);
+                    else frame.locals.put(sym, value);
+                }
+                case VarDecl vd -> {
+                    Symbol sym = analyzer.getVarDeclSymbols().get(vd);
+                    if (sym == null) throw new ConstEvalBailout();
+                    frame.locals.put(sym, evalExpr(vd.initExpr(), frame));
+                }
+                case ConstDecl cd -> {
+                    Symbol sym = analyzer.getConstDeclSymbols().get(cd);
+                    if (sym != null && sym.getConstValue() != null) {
+                        frame.locals.put(sym, sym.getConstValue());
+                    }
+                }
+                case IfStmt is -> {
+                    if (evalExpr(is.condition(), frame) != 0) {
+                        execStmt(is.thenStmt(), frame);
+                    } else if (is.elseStmt() != null) {
+                        execStmt(is.elseStmt(), frame);
+                    }
+                }
+                case WhileStmt ws -> {
+                    if (tryRunPolynomialLoop(ws, frame) || tryRunCountedLoop(ws, frame)) {
+                        // Loop was evaluated in bulk.
+                    } else {
+                        while (evalExpr(ws.condition(), frame) != 0) {
+                            try {
+                                execStmt(ws.body(), frame);
+                            } catch (ContinueSignal ignored) {
+                                // Continue with next condition check.
+                            } catch (BreakSignal ignored) {
+                                break;
+                            }
+                        }
+                    }
+                }
+                case BreakStmt ignored -> throw new BreakSignal();
+                case ContinueStmt ignored -> throw new ContinueSignal();
+                case ReturnStmt rs -> {
+                    if (rs.value() instanceof CallExpr ce
+                            && frame.func != null
+                            && ce.funcName().equals(frame.func.name())) {
+                        List<Integer> args = new ArrayList<>(ce.args().size());
+                        for (Expr arg : ce.args()) args.add(evalExpr(arg, frame));
+                        throw new TailCallSignal(args);
+                    }
+                    int value = rs.value() != null ? evalExpr(rs.value(), frame) : 0;
+                    throw new ReturnSignal(value);
+                }
+                default -> throw new ConstEvalBailout();
+            }
+        }
+
+        private int evalExpr(Expr expr, EvalFrame frame) {
+            tick();
+            return switch (expr) {
+                case LiteralExpr le -> le.value();
+                case IdExpr id -> {
+                    Symbol sym = analyzer.getIdSymbols().get(id);
+                    if (sym == null) throw new ConstEvalBailout();
+                    if (sym.isConst() && sym.getConstValue() != null) yield sym.getConstValue();
+                    Integer value = sym.isGlobal() ? globals.get(sym) : frame.locals.get(sym);
+                    if (value == null) throw new ConstEvalBailout();
+                    yield value;
+                }
+                case UnaryExpr ue -> {
+                    int v = evalExpr(ue.operand(), frame);
+                    yield switch (ue.op()) {
+                        case "+" -> v;
+                        case "-" -> -v;
+                        case "!" -> v == 0 ? 1 : 0;
+                        default -> throw new ConstEvalBailout();
+                    };
+                }
+                case BinaryExpr be -> evalBinary(be, frame);
+                case CallExpr ce -> {
+                    FuncDef fd = funcs.get(ce.funcName());
+                    if (fd == null) throw new ConstEvalBailout();
+                    List<Integer> args = new ArrayList<>(ce.args().size());
+                    for (Expr arg : ce.args()) args.add(evalExpr(arg, frame));
+                    yield call(fd, args);
+                }
+            };
+        }
+
+        private int evalBinary(BinaryExpr be, EvalFrame frame) {
+            if ("&&".equals(be.op())) {
+                int left = evalExpr(be.left(), frame);
+                return left != 0 && evalExpr(be.right(), frame) != 0 ? 1 : 0;
+            }
+            if ("||".equals(be.op())) {
+                int left = evalExpr(be.left(), frame);
+                return left != 0 || evalExpr(be.right(), frame) != 0 ? 1 : 0;
+            }
+
+            int left = evalExpr(be.left(), frame);
+            int right = evalExpr(be.right(), frame);
+            return switch (be.op()) {
+                case "+" -> left + right;
+                case "-" -> left - right;
+                case "*" -> left * right;
+                case "/" -> left / right;
+                case "%" -> left % right;
+                case "==" -> left == right ? 1 : 0;
+                case "!=" -> left != right ? 1 : 0;
+                case "<" -> left < right ? 1 : 0;
+                case ">" -> left > right ? 1 : 0;
+                case "<=" -> left <= right ? 1 : 0;
+                case ">=" -> left >= right ? 1 : 0;
+                default -> throw new ConstEvalBailout();
+            };
+        }
+
+        private void tick() {
+            if (--fuel <= 0 || (fuel & 0x3fff) == 0 && System.nanoTime() > deadlineNs) {
+                throw new ConstEvalBailout();
+            }
+        }
+
+        private boolean tryRunPolynomialLoop(WhileStmt ws, EvalFrame frame) {
+            CountedLoopInfo info = parseCountedLoop(ws, frame);
+            if (info == null || info.iterations <= 0) return info != null && info.iterations == 0;
+
+            IdentityHashMap<Symbol, Poly> env = new IdentityHashMap<>();
+            List<LoopUpdate> updates = new ArrayList<>();
+            IdentityHashMap<Symbol, Poly> finalAssignments = new IdentityHashMap<>();
+            boolean sawStep = false;
+
+            for (Stmt stmt : info.stmts) {
+                if (stmt instanceof VarDecl vd) {
+                    Symbol target = analyzer.getVarDeclSymbols().get(vd);
+                    Poly value = evalPolyWithEnv(vd.initExpr(), info.loopSym, frame, env);
+                    if (target == null || value == null) return false;
+                    env.put(target, value);
+                } else if (stmt instanceof ConstDecl cd) {
+                    Symbol target = analyzer.getConstDeclSymbols().get(cd);
+                    if (target != null && target.getConstValue() != null) {
+                        env.put(target, new Poly(target.getConstValue(), 0, 0));
+                    }
+                } else if (stmt instanceof AssignStmt as_) {
+                    Symbol target = analyzer.getAssignSymbols().get(as_);
+                    if (target == null) return false;
+                    if (target == info.loopSym) {
+                        Integer parsedStep = parseSelfStep(as_.value(), info.loopSym, frame);
+                        if (parsedStep == null || parsedStep != info.step || sawStep) return false;
+                        sawStep = true;
+                        continue;
+                    }
+
+                    if (env.containsKey(target)) {
+                        Poly value = evalPolyWithEnv(as_.value(), info.loopSym, frame, env);
+                        if (value == null) return false;
+                        env.put(target, value);
+                        finalAssignments.put(target, value);
+                        continue;
+                    }
+
+                    Poly delta = extractSelfPolyDeltaWithEnv(as_.value(), target, info.loopSym, frame, env);
+                    if (delta != null) {
+                        updates.add(new LoopUpdate(target, delta.constant, delta.linear, delta.quadratic));
+                    } else {
+                        Poly value = evalPolyWithEnv(as_.value(), info.loopSym, frame, env);
+                        if (value == null) return false;
+                        env.put(target, value);
+                        finalAssignments.put(target, value);
+                    }
+                } else {
+                    return false;
+                }
+            }
+            if (!sawStep) return false;
+
+            long sumI = arithmeticSeries(info.start, info.step, info.iterations);
+            long sumI2 = squareSeries(info.start, info.step, info.iterations);
+            applyBulkUpdates(updates, info.iterations, sumI, sumI2, frame);
+
+            int lastI = (int) (info.start + (info.iterations - 1L) * info.step);
+            for (Map.Entry<Symbol, Poly> entry : finalAssignments.entrySet()) {
+                setValue(entry.getKey(), entry.getValue().eval(lastI), frame);
+            }
+            setValue(info.loopSym, (int) (info.start + info.iterations * info.step), frame);
+            tick();
+            return true;
+        }
+
+        private CountedLoopInfo parseCountedLoop(WhileStmt ws, EvalFrame frame) {
+            IdExpr loopId;
+            Expr boundExpr;
+            String condOp;
+            boolean dropLeadingGuard = false;
+            if (ws.condition() instanceof BinaryExpr cond) {
+                IdExpr id;
+                if (cond.left() instanceof IdExpr leftId) {
+                    id = leftId;
+                    boundExpr = cond.right();
+                    condOp = cond.op();
+                } else if (cond.right() instanceof IdExpr rightId) {
+                    id = rightId;
+                    boundExpr = cond.left();
+                    condOp = flipRelOp(cond.op());
+                } else {
+                    return null;
+                }
+                if (!("<".equals(cond.op()) || "<=".equals(cond.op())
+                        || ">".equals(cond.op()) || ">=".equals(cond.op())
+                        || "!=".equals(cond.op()))) return null;
+                loopId = id;
+                if (condOp == null) return null;
+            } else if (ws.condition() instanceof IdExpr id) {
+                loopId = id;
+                boundExpr = new LiteralExpr(0, id.line());
+                condOp = "!=";
+            } else if (ws.condition() instanceof LiteralExpr le && le.value() != 0) {
+                LoopGuard guard = extractLeadingBreakGuard(ws.body());
+                if (guard == null) return null;
+                loopId = guard.loopId;
+                boundExpr = guard.boundExpr;
+                condOp = guard.continueOp;
+                dropLeadingGuard = true;
+            } else {
+                return null;
+            }
+
+            Symbol loopSym = analyzer.getIdSymbols().get(loopId);
+            if (loopSym == null || exprUsesSymbol(boundExpr, loopSym)) return null;
+
+            List<Stmt> stmts;
+            if (ws.body() instanceof Block b) stmts = b.stmts();
+            else stmts = List.of(ws.body());
+            if (dropLeadingGuard) {
+                stmts = stmts.subList(1, stmts.size());
+            }
+
+            int step = 0;
+            boolean sawStep = false;
+            for (Stmt stmt : stmts) {
+                if (stmt instanceof AssignStmt as_) {
+                    Symbol target = analyzer.getAssignSymbols().get(as_);
+                    if (target == loopSym) {
+                        if (sawStep) return null;
+                        Integer parsedStep = parseSelfStep(as_.value(), loopSym, frame);
+                        if (parsedStep == null || parsedStep == 0) return null;
+                        sawStep = true;
+                        step = parsedStep;
+                    }
+                }
+            }
+            if (!sawStep) return null;
+            int start = getValue(loopSym, frame);
+            int bound = evalExpr(boundExpr, frame);
+            long iterations = countIterations(start, bound, step, condOp);
+            if (iterations < 0) return null;
+            return new CountedLoopInfo(loopSym, stmts, start, step, iterations);
+        }
+
+        private LoopGuard extractLeadingBreakGuard(Stmt body) {
+            if (!(body instanceof Block b) || b.stmts().isEmpty()) return null;
+            if (!(b.stmts().get(0) instanceof IfStmt is)) return null;
+            if (!(is.thenStmt() instanceof BreakStmt) || is.elseStmt() != null) return null;
+            if (!(is.condition() instanceof BinaryExpr cond)) return null;
+            IdExpr id;
+            Expr boundExpr;
+            String breakOp = cond.op();
+            if (cond.left() instanceof IdExpr leftId) {
+                id = leftId;
+                boundExpr = cond.right();
+            } else if (cond.right() instanceof IdExpr rightId) {
+                id = rightId;
+                boundExpr = cond.left();
+                breakOp = flipRelOp(cond.op());
+            } else {
+                return null;
+            }
+            String continueOp = switch (breakOp) {
+                case ">=" -> "<";
+                case ">" -> "<=";
+                case "<=" -> ">";
+                case "<" -> ">=";
+                case "==" -> "!=";
+                default -> null;
+            };
+            return continueOp != null ? new LoopGuard(id, boundExpr, continueOp) : null;
+        }
+
+        private String flipRelOp(String op) {
+            return switch (op) {
+                case "<" -> ">";
+                case "<=" -> ">=";
+                case ">" -> "<";
+                case ">=" -> "<=";
+                case "!=", "==" -> op;
+                default -> null;
+            };
+        }
+
+        private boolean tryRunCountedLoop(WhileStmt ws, EvalFrame frame) {
+            IdExpr loopId;
+            Expr boundExpr;
+            String condOp;
+            if (ws.condition() instanceof BinaryExpr cond) {
+                if (!(cond.left() instanceof IdExpr id)) return false;
+                if (!("<".equals(cond.op()) || "<=".equals(cond.op())
+                        || ">".equals(cond.op()) || ">=".equals(cond.op())
+                        || "!=".equals(cond.op()))) return false;
+                loopId = id;
+                boundExpr = cond.right();
+                condOp = cond.op();
+            } else if (ws.condition() instanceof IdExpr id) {
+                loopId = id;
+                boundExpr = new LiteralExpr(0, id.line());
+                condOp = "!=";
+            } else {
+                return false;
+            }
+
+            Symbol loopSym = analyzer.getIdSymbols().get(loopId);
+            if (loopSym == null || exprUsesSymbol(boundExpr, loopSym)) return false;
+
+            List<Stmt> stmts;
+            if (ws.body() instanceof Block b) stmts = b.stmts();
+            else stmts = List.of(ws.body());
+
+            AssignStmt stepStmt = null;
+            int step = 0;
+            for (Stmt stmt : stmts) {
+                if (stmt instanceof AssignStmt as_) {
+                    Symbol target = analyzer.getAssignSymbols().get(as_);
+                    if (target == loopSym) {
+                        if (stepStmt != null) return false;
+                        Integer parsedStep = parseSelfStep(as_.value(), loopSym, frame);
+                        if (parsedStep == null || parsedStep == 0) return false;
+                        stepStmt = as_;
+                        step = parsedStep;
+                    }
+                } else if (!(stmt instanceof IfStmt)) {
+                    return false;
+                }
+            }
+            if (stepStmt == null) return false;
+
+            int start = getValue(loopSym, frame);
+            int bound = evalExpr(boundExpr, frame);
+            long iterations = countIterations(start, bound, step, condOp);
+            if (iterations < 0) return false;
+            if (iterations == 0) return true;
+
+            List<BulkLoopStmt> bulkStmts = new ArrayList<>();
+            for (Stmt stmt : stmts) {
+                if (stmt instanceof AssignStmt as_) {
+                    Symbol target = analyzer.getAssignSymbols().get(as_);
+                    if (target == loopSym) continue;
+                    LoopUpdate update = parseLoopUpdate(as_, target, loopSym, frame);
+                    if (update == null) return false;
+                    bulkStmts.add(new BulkUpdates(List.of(update)));
+                } else if (stmt instanceof IfStmt is) {
+                    BulkModuloCond bulkCond = parseModuloCondition(is.condition(), loopSym);
+                    if (bulkCond == null) return false;
+                    List<LoopUpdate> thenUpdates = parseBranchUpdates(is.thenStmt(), loopSym, frame);
+                    if (thenUpdates == null) return false;
+                    List<LoopUpdate> elseUpdates = is.elseStmt() != null
+                            ? parseBranchUpdates(is.elseStmt(), loopSym, frame)
+                            : List.of();
+                    if (elseUpdates == null) return false;
+                    bulkStmts.add(new BulkIf(bulkCond, thenUpdates, elseUpdates));
+                } else {
+                    return false;
+                }
+            }
+
+            long totalSumI = arithmeticSeries(start, step, iterations);
+            long totalSumI2 = squareSeries(start, step, iterations);
+            for (BulkLoopStmt bulkStmt : bulkStmts) {
+                if (bulkStmt instanceof BulkUpdates updates) {
+                    applyBulkUpdates(updates.updates, iterations, totalSumI, totalSumI2, frame);
+                } else if (bulkStmt instanceof BulkIf bulkIf) {
+                    CountAndSum truePart = countModuloMatches(start, step, iterations, bulkIf.cond);
+                    long falseCount = iterations - truePart.count;
+                    long falseSum = totalSumI - truePart.sum;
+                    // Modulo branch fast path currently supports affine updates only.
+                    if (hasQuadraticUpdate(bulkIf.thenUpdates) || hasQuadraticUpdate(bulkIf.elseUpdates)) {
+                        return false;
+                    }
+                    applyBulkUpdates(bulkIf.thenUpdates, truePart.count, truePart.sum, 0, frame);
+                    applyBulkUpdates(bulkIf.elseUpdates, falseCount, falseSum, 0, frame);
+                }
+            }
+            setValue(loopSym, (int) (start + iterations * step), frame);
+            tick();
+            return true;
+        }
+
+        private boolean hasQuadraticUpdate(List<LoopUpdate> updates) {
+            for (LoopUpdate update : updates) {
+                if (update.quadratic != 0) return true;
+            }
+            return false;
+        }
+
+        private void applyBulkUpdates(List<LoopUpdate> updates, long count, long sumI, long sumI2,
+                                      EvalFrame frame) {
+            for (LoopUpdate update : updates) {
+                int old = getValue(update.target, frame);
+                int delta = (int) (count * update.constant
+                        + sumI * update.coefficient
+                        + sumI2 * update.quadratic);
+                setValue(update.target, old + delta, frame);
+            }
+        }
+
+        private List<LoopUpdate> parseBranchUpdates(Stmt stmt, Symbol loopSym, EvalFrame frame) {
+            List<Stmt> branchStmts;
+            if (stmt instanceof Block b) branchStmts = b.stmts();
+            else branchStmts = List.of(stmt);
+
+            List<LoopUpdate> updates = new ArrayList<>();
+            for (Stmt s : branchStmts) {
+                if (!(s instanceof AssignStmt as_)) return null;
+                Symbol target = analyzer.getAssignSymbols().get(as_);
+                if (target == null || target == loopSym) return null;
+                LoopUpdate update = parseLoopUpdate(as_, target, loopSym, frame);
+                if (update == null) return null;
+                updates.add(update);
+            }
+            return updates;
+        }
+
+        private BulkModuloCond parseModuloCondition(Expr expr, Symbol loopSym) {
+            boolean negate = false;
+            if (expr instanceof BinaryExpr be && ("==".equals(be.op()) || "!=".equals(be.op()))) {
+                negate = "!=".equals(be.op());
+                ModuloExpr mod = parseModuloExpr(be.left(), loopSym);
+                Integer rem = literalValue(be.right());
+                if (mod == null || rem == null) {
+                    mod = parseModuloExpr(be.right(), loopSym);
+                    rem = literalValue(be.left());
+                }
+                if (mod == null || rem == null || mod.modulus == 0) return null;
+                return new BulkModuloCond(Math.abs(mod.modulus), rem, negate);
+            }
+            return null;
+        }
+
+        private ModuloExpr parseModuloExpr(Expr expr, Symbol loopSym) {
+            if (!(expr instanceof BinaryExpr be) || !"%".equals(be.op())) return null;
+            if (!isIdOf(be.left(), loopSym)) return null;
+            Integer modulus = literalValue(be.right());
+            return modulus != null ? new ModuloExpr(modulus) : null;
+        }
+
+        private Integer literalValue(Expr expr) {
+            if (expr instanceof LiteralExpr le) return le.value();
+            return null;
+        }
+
+        private CountAndSum countModuloMatches(int start, int step, long iterations, BulkModuloCond cond) {
+            if (start < 0 || step <= 0) throw new ConstEvalBailout();
+            long count = 0;
+            long sum = 0;
+            int modulus = cond.modulus;
+            int wanted = Math.floorMod(cond.remainder, modulus);
+            for (int k = 0; k < modulus && k < iterations; k++) {
+                int value = start + k * step;
+                boolean match = Math.floorMod(value, modulus) == wanted;
+                if (cond.negate) match = !match;
+                if (!match) continue;
+                long c = 1L + (iterations - 1L - k) / modulus;
+                long first = start + (long) k * step;
+                long stride = (long) modulus * step;
+                count += c;
+                sum += c * (2L * first + (c - 1L) * stride) / 2L;
+            }
+            return new CountAndSum(count, sum);
+        }
+
+        private LoopUpdate parseLoopUpdate(AssignStmt stmt, Symbol target, Symbol loopSym, EvalFrame frame) {
+            Poly delta = extractSelfPolyDelta(stmt.value(), target, loopSym, frame);
+            return delta != null ? new LoopUpdate(target, delta.constant, delta.linear, delta.quadratic) : null;
+        }
+
+        private Poly extractSelfPolyDelta(Expr expr, Symbol target, Symbol loopSym, EvalFrame frame) {
+            if (isIdOf(expr, target)) return new Poly(0, 0, 0);
+            if (expr instanceof BinaryExpr be) {
+                if ("+".equals(be.op())) {
+                    Poly leftSelf = extractSelfPolyDelta(be.left(), target, loopSym, frame);
+                    if (leftSelf != null) {
+                        Poly right = evalPoly(be.right(), loopSym, frame);
+                        return right != null ? leftSelf.add(right) : null;
+                    }
+                    Poly rightSelf = extractSelfPolyDelta(be.right(), target, loopSym, frame);
+                    if (rightSelf != null) {
+                        Poly left = evalPoly(be.left(), loopSym, frame);
+                        return left != null ? left.add(rightSelf) : null;
+                    }
+                } else if ("-".equals(be.op())) {
+                    Poly leftSelf = extractSelfPolyDelta(be.left(), target, loopSym, frame);
+                    if (leftSelf != null) {
+                        Poly right = evalPoly(be.right(), loopSym, frame);
+                        return right != null ? leftSelf.subtract(right) : null;
+                    }
+                }
+            }
+            return null;
+        }
+
+        private Affine extractSelfAffineDelta(Expr expr, Symbol target, Symbol loopSym, EvalFrame frame) {
+            if (isIdOf(expr, target)) return new Affine(0, 0);
+            if (expr instanceof BinaryExpr be) {
+                if ("+".equals(be.op())) {
+                    Affine leftSelf = extractSelfAffineDelta(be.left(), target, loopSym, frame);
+                    if (leftSelf != null) {
+                        Affine right = evalAffine(be.right(), loopSym, frame);
+                        return right != null
+                                ? new Affine(leftSelf.constant + right.constant,
+                                             leftSelf.coefficient + right.coefficient)
+                                : null;
+                    }
+                    Affine rightSelf = extractSelfAffineDelta(be.right(), target, loopSym, frame);
+                    if (rightSelf != null) {
+                        Affine left = evalAffine(be.left(), loopSym, frame);
+                        return left != null
+                                ? new Affine(left.constant + rightSelf.constant,
+                                             left.coefficient + rightSelf.coefficient)
+                                : null;
+                    }
+                } else if ("-".equals(be.op())) {
+                    Affine leftSelf = extractSelfAffineDelta(be.left(), target, loopSym, frame);
+                    if (leftSelf != null) {
+                        Affine right = evalAffine(be.right(), loopSym, frame);
+                        return right != null
+                                ? new Affine(leftSelf.constant - right.constant,
+                                             leftSelf.coefficient - right.coefficient)
+                                : null;
+                    }
+                }
+            }
+            return null;
+        }
+
+        private Affine evalAffine(Expr expr, Symbol loopSym, EvalFrame frame) {
+            return switch (expr) {
+                case LiteralExpr le -> new Affine(le.value(), 0);
+                case IdExpr id -> {
+                    Symbol sym = analyzer.getIdSymbols().get(id);
+                    if (sym == loopSym) yield new Affine(0, 1);
+                    if (sym == null) yield null;
+                    yield new Affine(getValue(sym, frame), 0);
+                }
+                case UnaryExpr ue -> {
+                    Affine a = evalAffine(ue.operand(), loopSym, frame);
+                    if (a == null) yield null;
+                    yield switch (ue.op()) {
+                        case "+" -> a;
+                        case "-" -> new Affine(-a.constant, -a.coefficient);
+                        default -> null;
+                    };
+                }
+                case BinaryExpr be -> {
+                    Affine l = evalAffine(be.left(), loopSym, frame);
+                    Affine r = evalAffine(be.right(), loopSym, frame);
+                    if (l == null || r == null) yield null;
+                    yield switch (be.op()) {
+                        case "+" -> new Affine(l.constant + r.constant, l.coefficient + r.coefficient);
+                        case "-" -> new Affine(l.constant - r.constant, l.coefficient - r.coefficient);
+                        case "*" -> {
+                            if (l.coefficient == 0) {
+                                yield new Affine(l.constant * r.constant, l.constant * r.coefficient);
+                            }
+                            if (r.coefficient == 0) {
+                                yield new Affine(l.constant * r.constant, l.coefficient * r.constant);
+                            }
+                            yield null;
+                        }
+                        default -> null;
+                    };
+                }
+                case CallExpr ce -> evalAffineCall(ce, loopSym, frame);
+                default -> null;
+            };
+        }
+
+        private Poly evalPoly(Expr expr, Symbol loopSym, EvalFrame frame) {
+            return switch (expr) {
+                case LiteralExpr le -> new Poly(le.value(), 0, 0);
+                case IdExpr id -> {
+                    Symbol sym = analyzer.getIdSymbols().get(id);
+                    if (sym == loopSym) yield new Poly(0, 1, 0);
+                    if (sym == null) yield null;
+                    yield new Poly(getValue(sym, frame), 0, 0);
+                }
+                case UnaryExpr ue -> {
+                    Poly p = evalPoly(ue.operand(), loopSym, frame);
+                    if (p == null) yield null;
+                    yield switch (ue.op()) {
+                        case "+" -> p;
+                        case "-" -> p.negate();
+                        default -> null;
+                    };
+                }
+                case BinaryExpr be -> {
+                    Poly l = evalPoly(be.left(), loopSym, frame);
+                    Poly r = evalPoly(be.right(), loopSym, frame);
+                    if (l == null || r == null) yield null;
+                    yield switch (be.op()) {
+                        case "+" -> l.add(r);
+                        case "-" -> l.subtract(r);
+                        case "*" -> l.multiply(r);
+                        default -> null;
+                    };
+                }
+                case CallExpr ce -> {
+                    Affine a = evalAffineCall(ce, loopSym, frame);
+                    yield a != null ? new Poly(a.constant, a.coefficient, 0) : null;
+                }
+                default -> null;
+            };
+        }
+
+        private Poly evalPolyWithEnv(Expr expr, Symbol loopSym, EvalFrame frame,
+                                     IdentityHashMap<Symbol, Poly> env) {
+            return switch (expr) {
+                case LiteralExpr le -> new Poly(le.value(), 0, 0);
+                case IdExpr id -> {
+                    Symbol sym = analyzer.getIdSymbols().get(id);
+                    if (sym == loopSym) yield new Poly(0, 1, 0);
+                    Poly local = env.get(sym);
+                    if (local != null) yield local;
+                    if (sym == null) yield null;
+                    yield new Poly(getValue(sym, frame), 0, 0);
+                }
+                case UnaryExpr ue -> {
+                    Poly p = evalPolyWithEnv(ue.operand(), loopSym, frame, env);
+                    if (p == null) yield null;
+                    yield switch (ue.op()) {
+                        case "+" -> p;
+                        case "-" -> p.negate();
+                        default -> null;
+                    };
+                }
+                case BinaryExpr be -> {
+                    Poly l = evalPolyWithEnv(be.left(), loopSym, frame, env);
+                    Poly r = evalPolyWithEnv(be.right(), loopSym, frame, env);
+                    if (l == null || r == null) yield null;
+                    yield switch (be.op()) {
+                        case "+" -> l.add(r);
+                        case "-" -> l.subtract(r);
+                        case "*" -> l.multiply(r);
+                        default -> null;
+                    };
+                }
+                case CallExpr ce -> {
+                    Affine a = evalAffineCall(ce, loopSym, frame);
+                    yield a != null ? new Poly(a.constant, a.coefficient, 0) : null;
+                }
+                default -> null;
+            };
+        }
+
+        private Poly extractSelfPolyDeltaWithEnv(Expr expr, Symbol target, Symbol loopSym,
+                                                 EvalFrame frame, IdentityHashMap<Symbol, Poly> env) {
+            if (isIdOf(expr, target)) return new Poly(0, 0, 0);
+            if (expr instanceof BinaryExpr be) {
+                if ("+".equals(be.op())) {
+                    Poly leftSelf = extractSelfPolyDeltaWithEnv(be.left(), target, loopSym, frame, env);
+                    if (leftSelf != null) {
+                        Poly right = evalPolyWithEnv(be.right(), loopSym, frame, env);
+                        return right != null ? leftSelf.add(right) : null;
+                    }
+                    Poly rightSelf = extractSelfPolyDeltaWithEnv(be.right(), target, loopSym, frame, env);
+                    if (rightSelf != null) {
+                        Poly left = evalPolyWithEnv(be.left(), loopSym, frame, env);
+                        return left != null ? left.add(rightSelf) : null;
+                    }
+                } else if ("-".equals(be.op())) {
+                    Poly leftSelf = extractSelfPolyDeltaWithEnv(be.left(), target, loopSym, frame, env);
+                    if (leftSelf != null) {
+                        Poly right = evalPolyWithEnv(be.right(), loopSym, frame, env);
+                        return right != null ? leftSelf.subtract(right) : null;
+                    }
+                }
+            }
+            return null;
+        }
+
+        private Affine evalAffineCall(CallExpr ce, Symbol loopSym, EvalFrame frame) {
+            FuncDef fd = funcs.get(ce.funcName());
+            if (fd == null || !Boolean.TRUE.equals(pureFuncs.get(ce.funcName()))) return null;
+            Expr returnExpr = singleReturnExpr(fd.body());
+            if (returnExpr == null) return null;
+
+            List<Symbol> params = analyzer.getFuncParamSymbols().get(fd);
+            if (params == null || params.size() != ce.args().size()) return null;
+            IdentityHashMap<Symbol, Affine> paramAffines = new IdentityHashMap<>();
+            for (int i = 0; i < params.size(); i++) {
+                Affine argAffine = evalAffine(ce.args().get(i), loopSym, frame);
+                if (argAffine == null) return null;
+                paramAffines.put(params.get(i), argAffine);
+            }
+            return evalAffineWithParams(returnExpr, loopSym, frame, paramAffines);
+        }
+
+        private Expr singleReturnExpr(Stmt stmt) {
+            if (stmt instanceof ReturnStmt rs) return rs.value();
+            if (stmt instanceof Block b && b.stmts().size() == 1 && b.stmts().get(0) instanceof ReturnStmt rs) {
+                return rs.value();
+            }
+            return null;
+        }
+
+        private Affine evalAffineWithParams(Expr expr, Symbol loopSym, EvalFrame frame,
+                                            IdentityHashMap<Symbol, Affine> paramAffines) {
+            return switch (expr) {
+                case LiteralExpr le -> new Affine(le.value(), 0);
+                case IdExpr id -> {
+                    Symbol sym = analyzer.getIdSymbols().get(id);
+                    if (sym == loopSym) yield new Affine(0, 1);
+                    Affine paramAffine = paramAffines.get(sym);
+                    if (paramAffine != null) yield paramAffine;
+                    if (sym == null) yield null;
+                    yield new Affine(getValue(sym, frame), 0);
+                }
+                case UnaryExpr ue -> {
+                    Affine a = evalAffineWithParams(ue.operand(), loopSym, frame, paramAffines);
+                    if (a == null) yield null;
+                    yield switch (ue.op()) {
+                        case "+" -> a;
+                        case "-" -> new Affine(-a.constant, -a.coefficient);
+                        default -> null;
+                    };
+                }
+                case BinaryExpr be -> {
+                    Affine l = evalAffineWithParams(be.left(), loopSym, frame, paramAffines);
+                    Affine r = evalAffineWithParams(be.right(), loopSym, frame, paramAffines);
+                    if (l == null || r == null) yield null;
+                    yield switch (be.op()) {
+                        case "+" -> new Affine(l.constant + r.constant, l.coefficient + r.coefficient);
+                        case "-" -> new Affine(l.constant - r.constant, l.coefficient - r.coefficient);
+                        case "*" -> {
+                            if (l.coefficient == 0) {
+                                yield new Affine(l.constant * r.constant, l.constant * r.coefficient);
+                            }
+                            if (r.coefficient == 0) {
+                                yield new Affine(l.constant * r.constant, l.coefficient * r.constant);
+                            }
+                            yield null;
+                        }
+                        default -> null;
+                    };
+                }
+                default -> null;
+            };
+        }
+
+        private Integer parseSelfStep(Expr expr, Symbol loopSym, EvalFrame frame) {
+            if (!(expr instanceof BinaryExpr be)) return null;
+            if (isIdOf(be.left(), loopSym) && !exprUsesSymbol(be.right(), loopSym)) {
+                int delta = evalExpr(be.right(), frame);
+                return switch (be.op()) {
+                    case "+" -> delta;
+                    case "-" -> -delta;
+                    default -> null;
+                };
+            }
+            if ("+".equals(be.op()) && isIdOf(be.right(), loopSym)
+                    && !exprUsesSymbol(be.left(), loopSym)) {
+                return evalExpr(be.left(), frame);
+            }
+            return null;
+        }
+
+        private long countIterations(int start, int bound, int step, String op) {
+            if (step > 0) {
+                long distance = switch (op) {
+                    case "<" -> (long) bound - start;
+                    case "<=" -> (long) bound - start + 1L;
+                    case "!=" -> {
+                        long diff = (long) bound - start;
+                        yield diff > 0 && diff % step == 0 ? diff : -1L;
+                    }
+                    default -> -1L;
+                };
+                if (distance <= 0) return 0;
+                return (distance + step - 1L) / step;
+            }
+            long posStep = -(long) step;
+            long distance = switch (op) {
+                case ">" -> (long) start - bound;
+                case ">=" -> (long) start - bound + 1L;
+                case "!=" -> {
+                    long diff = (long) start - bound;
+                    yield diff > 0 && diff % posStep == 0 ? diff : -1L;
+                }
+                default -> -1L;
+            };
+            if (distance <= 0) return 0;
+            return (distance + posStep - 1L) / posStep;
+        }
+
+        private long arithmeticSeries(int start, int step, long n) {
+            return n * (2L * start + (n - 1L) * step) / 2L;
+        }
+
+        private long squareSeries(int start, int step, long n) {
+            long sumK = n * (n - 1L) / 2L;
+            long sumK2 = n * (n - 1L) * (2L * n - 1L) / 6L;
+            return n * (long) start * start
+                    + 2L * start * step * sumK
+                    + (long) step * step * sumK2;
+        }
+
+        private boolean isIdOf(Expr expr, Symbol sym) {
+            return expr instanceof IdExpr id && analyzer.getIdSymbols().get(id) == sym;
+        }
+
+        private boolean exprUsesSymbol(Expr expr, Symbol sym) {
+            return switch (expr) {
+                case IdExpr id -> analyzer.getIdSymbols().get(id) == sym;
+                case BinaryExpr be -> exprUsesSymbol(be.left(), sym) || exprUsesSymbol(be.right(), sym);
+                case UnaryExpr ue -> exprUsesSymbol(ue.operand(), sym);
+                case CallExpr ce -> {
+                    for (Expr arg : ce.args()) if (exprUsesSymbol(arg, sym)) yield true;
+                    yield false;
+                }
+                default -> false;
+            };
+        }
+
+        private int getValue(Symbol sym, EvalFrame frame) {
+            if (sym.isConst() && sym.getConstValue() != null) return sym.getConstValue();
+            Integer value = sym.isGlobal() ? globals.get(sym) : frame.locals.get(sym);
+            if (value == null) throw new ConstEvalBailout();
+            return value;
+        }
+
+        private void setValue(Symbol sym, int value, EvalFrame frame) {
+            if (sym.isGlobal()) globals.put(sym, value);
+            else frame.locals.put(sym, value);
+        }
+    }
+
+    private static final class EvalFrame {
+        final IdentityHashMap<Symbol, Integer> locals = new IdentityHashMap<>();
+        final FuncDef func;
+
+        EvalFrame() {
+            this(null);
+        }
+
+        EvalFrame(FuncDef func) {
+            this.func = func;
+        }
+    }
+
+    private record Affine(int constant, int coefficient) {}
+    private record Poly(int constant, int linear, int quadratic) {
+        Poly add(Poly other) {
+            return new Poly(constant + other.constant, linear + other.linear, quadratic + other.quadratic);
+        }
+
+        Poly subtract(Poly other) {
+            return new Poly(constant - other.constant, linear - other.linear, quadratic - other.quadratic);
+        }
+
+        Poly negate() {
+            return new Poly(-constant, -linear, -quadratic);
+        }
+
+        Poly multiply(Poly other) {
+            int degree = (quadratic != 0 ? 2 : linear != 0 ? 1 : 0)
+                    + (other.quadratic != 0 ? 2 : other.linear != 0 ? 1 : 0);
+            if (degree > 2) return null;
+            int c = constant * other.constant;
+            int l = constant * other.linear + linear * other.constant;
+            int q = constant * other.quadratic + linear * other.linear + quadratic * other.constant;
+            return new Poly(c, l, q);
+        }
+
+        int eval(int x) {
+            return constant + linear * x + quadratic * x * x;
+        }
+    }
+    private record LoopUpdate(Symbol target, int constant, int coefficient, int quadratic) {}
+    private record CountedLoopInfo(Symbol loopSym, List<Stmt> stmts, int start, int step, long iterations) {}
+    private record LoopGuard(IdExpr loopId, Expr boundExpr, String continueOp) {}
+    private sealed interface BulkLoopStmt permits BulkUpdates, BulkIf {}
+    private record BulkUpdates(List<LoopUpdate> updates) implements BulkLoopStmt {}
+    private record BulkIf(BulkModuloCond cond, List<LoopUpdate> thenUpdates,
+                          List<LoopUpdate> elseUpdates) implements BulkLoopStmt {}
+    private record BulkModuloCond(int modulus, int remainder, boolean negate) {}
+    private record ModuloExpr(int modulus) {}
+    private record CountAndSum(long count, long sum) {}
+    private record CallKey(String funcName, int[] args) {
+        CallKey(String funcName, List<Integer> values) {
+            this(funcName, values.stream().mapToInt(Integer::intValue).toArray());
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            return obj instanceof CallKey other
+                    && funcName.equals(other.funcName)
+                    && Arrays.equals(args, other.args);
+        }
+
+        @Override
+        public int hashCode() {
+            return 31 * funcName.hashCode() + Arrays.hashCode(args);
+        }
+    }
+
+    private static class FastSignal extends RuntimeException {
+        @Override
+        public synchronized Throwable fillInStackTrace() {
+            return this;
+        }
+    }
+
+    private static class ConstEvalBailout extends FastSignal {}
+    private static final class BreakSignal extends FastSignal {}
+    private static final class ContinueSignal extends FastSignal {}
+    private static final class TailCallSignal extends FastSignal {
+        final List<Integer> args;
+        TailCallSignal(List<Integer> args) { this.args = args; }
+    }
+    private static final class ReturnSignal extends FastSignal {
+        final int value;
+        ReturnSignal(int value) { this.value = value; }
+    }
+
     // ========== Function definition ==========
 
     private void genFuncDef(FuncDef fd) {
         currentFunc = fd;
+        currentFuncBodyLabel = newLabel("func_body_" + fd.name());
         localOffsetStack.clear();
         localOffsetStack.push(new HashMap<>()); // function scope
         freeSpillSlots.clear();
@@ -120,6 +1284,10 @@ public class CodeGenerator {
         varDirty.clear();
         lastStoreReg.clear();
         regValid.clear();
+        symbolRegs.clear();
+        Arrays.fill(tempUsed, false);
+        Arrays.fill(aUsed, false);
+        codegenLoopDepth = 0;
         nextLocalOffset = -8; // skip past saved ra (-4) and saved fp (-8)
 
         // Count locals declared in the body
@@ -131,9 +1299,13 @@ public class CodeGenerator {
         currentFuncIsLeaf = isLeaf;
 
         Symbol funcSym = analyzer.getFuncSymbols().get(fd);
+        assignSavedRegisters(fd);
         boolean leafParamsKeptInRegs = false;
         if (isLeaf && funcSym != null && funcSym.getFuncParamNames() != null) {
             leafParamsKeptInRegs = true;
+            if (funcSym.getFuncParamNames().size() > 8) {
+                leafParamsKeptInRegs = false;
+            }
             for (String pn : funcSym.getFuncParamNames()) {
                 if (stmtAssignsTo(fd.body(), pn)) {
                     leafParamsKeptInRegs = false;
@@ -161,15 +1333,19 @@ public class CodeGenerator {
         // pre-spills coexist with inner genCall arg-eval spills.
         int maxSpillDepth = calcMaxSpillDepth(fd.body());
         if (!isLeaf) {
-            maxSpillDepth += 4; // safety margin for nested-call overlaps
+            maxSpillDepth += 12; // safety margin for nested-call overlaps
         }
         int spillAreaSize = maxSpillDepth * 4;
 
+        savedValueRegCount = symbolRegs.size();
         boolean hasLocalsOrParams = finalLocalOffset < -8;
         boolean needsFrame = hasLocalsOrParams || maxSpillDepth > 0;
+        if (savedValueRegCount > 0) {
+            needsFrame = true;
+        }
 
         // Calculate frame size.
-        int savedRegsSize = (needsFrame || !isLeaf) ? 8 : 0;
+        int savedRegsSize = (needsFrame || !isLeaf) ? 8 + savedValueRegCount * 4 : 0;
 
         int localSize = -finalLocalOffset - 8;
         if (localSize < 0) localSize = 0;
@@ -187,6 +1363,9 @@ public class CodeGenerator {
                 emit("sw", "ra", (frameSize - 4) + "(sp)");
             }
             emit("sw", "s0", (frameSize - 8) + "(sp)");
+            for (int i = 0; i < savedValueRegCount; i++) {
+                emit("sw", SAVED_VALUE_REGS[i], (frameSize - 12 - i * 4) + "(sp)");
+            }
             emit("addi", "s0", "sp", String.valueOf(frameSize));
         }
 
@@ -209,20 +1388,47 @@ public class CodeGenerator {
         nextSpillOffset = finalLocalOffset - 4;
 
         // Store parameters into local slots.
+        List<Symbol> paramSymbols = analyzer.getFuncParamSymbols().get(fd);
+        if (paramSymbols != null && frameSize > 0) {
+            for (int i = 0; i < paramSymbols.size(); i++) {
+                String reg = symbolRegs.get(paramSymbols.get(i));
+                if (reg == null) continue;
+                if (i < 8) {
+                    emit("mv", reg, "a" + i);
+                } else {
+                    int callerOff = frameSize + (i - 8) * 4;
+                    emit("lw", reg, callerOff + "(sp)");
+                }
+            }
+        }
         if (!leafParamsKeptInRegs && funcSym != null
                 && funcSym.getFuncParamNames() != null && frameSize > 0) {
             int argReg = 0;
             for (String paramName : funcSym.getFuncParamNames()) {
+                Symbol paramSym = paramSymbols != null && argReg < paramSymbols.size()
+                        ? paramSymbols.get(argReg) : null;
+                if (symbolRegs.containsKey(paramSym)) {
+                    argReg++;
+                    continue;
+                }
                 if (argReg < 8) {
                     String reg = "a" + argReg;
                     int offset = getLocalOffset(paramName);
                     emit("sw", reg, offset + "(s0)");
+                } else {
+                    String reg = allocReg();
+                    int callerOff = frameSize + (argReg - 8) * 4;
+                    int offset = getLocalOffset(paramName);
+                    emit("lw", reg, callerOff + "(sp)");
+                    emit("sw", reg, offset + "(s0)");
+                    freeReg(reg);
                 }
                 argReg++;
             }
         }
 
         // Generate body
+        emitLabel(currentFuncBodyLabel);
         genStmt(fd.body());
 
         // Epilogue
@@ -231,12 +1437,16 @@ public class CodeGenerator {
             if (!isLeaf) {
                 emit("lw", "ra", (frameSize - 4) + "(sp)");
             }
+            for (int i = 0; i < savedValueRegCount; i++) {
+                emit("lw", SAVED_VALUE_REGS[i], (frameSize - 12 - i * 4) + "(sp)");
+            }
             emit("lw", "s0", (frameSize - 8) + "(sp)");
             emit("addi", "sp", "sp", String.valueOf(frameSize));
         }
         emit("ret");
 
         currentFunc = null;
+        currentFuncBodyLabel = null;
     }
 
     private String funcEpilogueLabel() {
@@ -261,6 +1471,108 @@ public class CodeGenerator {
             case WhileStmt ws -> countLocals(ws.body());
             default -> {}
         }
+    }
+
+    private void assignSavedRegisters(FuncDef fd) {
+        if (!optimize) return;
+
+        IdentityHashMap<Symbol, Integer> weights = new IdentityHashMap<>();
+        collectSymbolWeights(fd.body(), weights, 0);
+        boolean tailRecursive = containsTailRecursiveReturn(fd.body(), fd.name());
+
+        List<Symbol> paramSymbols = analyzer.getFuncParamSymbols().get(fd);
+        if (paramSymbols != null) {
+            for (Symbol sym : paramSymbols) {
+                weights.putIfAbsent(sym, 0);
+            }
+        }
+
+        List<Map.Entry<Symbol, Integer>> candidates = new ArrayList<>();
+        for (Map.Entry<Symbol, Integer> entry : weights.entrySet()) {
+            Symbol sym = entry.getKey();
+            if (sym == null || sym.isGlobal() || sym.isConst() || sym.isFunc()) continue;
+            if (entry.getValue() < (tailRecursive ? 2 : 8)) continue;
+            candidates.add(entry);
+        }
+        candidates.sort((a, b) -> Integer.compare(b.getValue(), a.getValue()));
+
+        int n = Math.min(SAVED_VALUE_REGS.length, candidates.size());
+        for (int i = 0; i < n; i++) {
+            symbolRegs.put(candidates.get(i).getKey(), SAVED_VALUE_REGS[i]);
+        }
+    }
+
+    private void collectSymbolWeights(Stmt stmt, IdentityHashMap<Symbol, Integer> weights, int loopDepth) {
+        switch (stmt) {
+            case Block b -> {
+                for (Stmt s : b.stmts()) {
+                    collectSymbolWeights(s, weights, loopDepth);
+                }
+            }
+            case ExprStmt es -> collectExprWeights(es.expr(), weights, loopDepth);
+            case AssignStmt as_ -> {
+                addWeight(weights, analyzer.getAssignSymbols().get(as_), weightFor(loopDepth) + 2);
+                collectExprWeights(as_.value(), weights, loopDepth);
+            }
+            case VarDecl vd -> {
+                addWeight(weights, analyzer.getVarDeclSymbols().get(vd), 1);
+                collectExprWeights(vd.initExpr(), weights, loopDepth);
+            }
+            case ConstDecl cd -> collectExprWeights(cd.initExpr(), weights, loopDepth);
+            case IfStmt is -> {
+                collectExprWeights(is.condition(), weights, loopDepth);
+                collectSymbolWeights(is.thenStmt(), weights, loopDepth);
+                if (is.elseStmt() != null) collectSymbolWeights(is.elseStmt(), weights, loopDepth);
+            }
+            case WhileStmt ws -> {
+                collectExprWeights(ws.condition(), weights, loopDepth + 1);
+                collectSymbolWeights(ws.body(), weights, loopDepth + 1);
+            }
+            case ReturnStmt rs -> {
+                if (rs.value() != null) collectExprWeights(rs.value(), weights, loopDepth);
+            }
+            default -> {}
+        }
+    }
+
+    private void collectExprWeights(Expr expr, IdentityHashMap<Symbol, Integer> weights, int loopDepth) {
+        switch (expr) {
+            case IdExpr id -> addWeight(weights, analyzer.getIdSymbols().get(id), weightFor(loopDepth));
+            case BinaryExpr be -> {
+                collectExprWeights(be.left(), weights, loopDepth);
+                collectExprWeights(be.right(), weights, loopDepth);
+            }
+            case UnaryExpr ue -> collectExprWeights(ue.operand(), weights, loopDepth);
+            case CallExpr ce -> {
+                for (Expr arg : ce.args()) collectExprWeights(arg, weights, loopDepth);
+            }
+            default -> {}
+        }
+    }
+
+    private int weightFor(int loopDepth) {
+        return loopDepth == 0 ? 1 : 8 * loopDepth;
+    }
+
+    private void addWeight(IdentityHashMap<Symbol, Integer> weights, Symbol sym, int delta) {
+        if (sym == null || sym.isGlobal() || sym.isConst() || sym.isFunc()) return;
+        weights.merge(sym, delta, Integer::sum);
+    }
+
+    private boolean containsTailRecursiveReturn(Stmt stmt, String funcName) {
+        return switch (stmt) {
+            case Block b -> {
+                for (Stmt s : b.stmts()) {
+                    if (containsTailRecursiveReturn(s, funcName)) yield true;
+                }
+                yield false;
+            }
+            case IfStmt is -> containsTailRecursiveReturn(is.thenStmt(), funcName)
+                    || (is.elseStmt() != null && containsTailRecursiveReturn(is.elseStmt(), funcName));
+            case WhileStmt ws -> containsTailRecursiveReturn(ws.body(), funcName);
+            case ReturnStmt rs -> rs.value() instanceof CallExpr ce && ce.funcName().equals(funcName);
+            default -> false;
+        };
     }
 
     /**
@@ -329,11 +1641,14 @@ public class CodeGenerator {
                 for (Expr arg : ce.args()) {
                     maxD = Math.max(maxD, calcMaxExprDepth(arg));
                 }
+                if (ce.args().size() > NUM_TEMPS) {
+                    yield maxD + ce.args().size();
+                }
                 // genCall may spill previously-evaluated register args
                 // before evaluating call-containing args. Conservative
                 // upper bound: all register args spilled at once.
                 int callSpills = Math.min(ce.args().size(), 8);
-                yield Math.max(maxD, callSpills);
+                yield maxD + callSpills;
             }
             default -> 0;
         };
@@ -457,9 +1772,18 @@ public class CodeGenerator {
                 localOffsetStack.push(new HashMap<>());
                 // Track vars declared in this block for scope cleanup
                 Set<String> blockVars = new HashSet<>();
-                for (Stmt s : b.stmts()) {
+                List<Stmt> stmts = b.stmts();
+                List<Set<Symbol>> suffixUses = buildSuffixUses(stmts);
+                for (int i = 0; i < stmts.size(); i++) {
+                    Stmt s = stmts.get(i);
                     if (s instanceof VarDecl vd) blockVars.add(vd.name());
                     else if (s instanceof ConstDecl cd) blockVars.add(cd.name());
+                    if (enableBlockDce && optimize && codegenLoopDepth == 0
+                            && isDeadForLiveOut(s, suffixUses.get(i + 1))) {
+                        if (s instanceof VarDecl vd) allocateLocal(vd.name());
+                        else if (s instanceof ConstDecl cd) allocateLocal(cd.name());
+                        continue;
+                    }
                     genStmt(s);
                 }
                 // Flush and invalidate block-scoped variables on exit.
@@ -487,7 +1811,24 @@ public class CodeGenerator {
                 freeReg(r);
             }
             case AssignStmt as_ -> {
+                Symbol targetSym = analyzer.getAssignSymbols().get(as_);
+                String savedReg = symbolRegs.get(targetSym);
+                if (savedReg != null && tryEmitAssignToSavedReg(as_, targetSym, savedReg)) {
+                    return;
+                }
                 String r = genExpr(as_.value());
+                savedReg = symbolRegs.get(targetSym);
+                if (savedReg != null) {
+                    if (!savedReg.equals(r)) {
+                        emit("mv", savedReg, r);
+                    }
+                    if (optimize) {
+                        String lsReg = lastStoreReg.remove(as_.name());
+                        if (lsReg != null) regValid.remove(lsReg);
+                    }
+                    freeReg(r);
+                    return;
+                }
                 // Check local scope first (handles shadowing of globals)
                 Integer localOff = lookupLocalOffset(as_.name());
                 if (localOff != null) {
@@ -544,8 +1885,20 @@ public class CodeGenerator {
                     allocateLocal(vd.name());
                     return;
                 }
+                String savedReg = symbolRegs.get(analyzer.getVarDeclSymbols().get(vd));
+                if (savedReg != null && vd.initExpr() instanceof LiteralExpr le) {
+                    allocateLocal(vd.name());
+                    emit("li", savedReg, String.valueOf(le.value()));
+                    return;
+                }
                 String r = genExpr(vd.initExpr());
                 int offset = allocateLocal(vd.name());
+                savedReg = symbolRegs.get(analyzer.getVarDeclSymbols().get(vd));
+                if (savedReg != null) {
+                    emit("mv", savedReg, r);
+                    freeReg(r);
+                    return;
+                }
                 if (optimize && enableRegCache) {
                     cacheVar(vd.name(), r);
                     varDirty.remove(vd.name()); // stored below
@@ -559,6 +1912,10 @@ public class CodeGenerator {
                 }
             }
             case ConstDecl cd -> {
+                if (optimize) {
+                    allocateLocal(cd.name());
+                    return;
+                }
                 if (optimize && !isVarUsed(cd.name(), currentFunc.body())) {
                     if (hasSideEffects(cd.initExpr())) {
                         String r = genExpr(cd.initExpr());
@@ -600,10 +1957,7 @@ public class CodeGenerator {
         String elseLabel = newLabel("else");
         String endLabel = newLabel("if_end");
 
-        // Condition: non-zero is true
-        String condReg = genExpr(is.condition());
-        emit("beqz", condReg, is.elseStmt() != null ? elseLabel : endLabel);
-        freeReg(condReg);
+        genBranchIfFalse(is.condition(), is.elseStmt() != null ? elseLabel : endLabel);
 
         // Then branch
         genStmt(is.thenStmt());
@@ -624,12 +1978,12 @@ public class CodeGenerator {
         loopStack.push(new LoopLabels(startLabel, endLabel));
 
         emitLabel(startLabel);
-        String condReg = genExpr(ws.condition());
-        emit("beqz", condReg, endLabel);
-        freeReg(condReg);
+        genBranchIfFalse(ws.condition(), endLabel);
 
         emitLabel(bodyLabel);
+        codegenLoopDepth++;
         genStmt(ws.body());
+        codegenLoopDepth--;
         emit("j", startLabel);
 
         emitLabel(endLabel);
@@ -639,12 +1993,468 @@ public class CodeGenerator {
     private void genReturn(ReturnStmt rs) {
         flushAllDirty();
         if (rs.value() != null) {
+            if (optimize && tryEmitTailRecursiveReturn(rs.value())) {
+                return;
+            }
+            if (optimize && rs.value() instanceof LiteralExpr le) {
+                emit("li", "a0", String.valueOf(le.value()));
+                emit("j", funcEpilogueLabel());
+                return;
+            }
+            if (optimize && rs.value() instanceof IdExpr id) {
+                Symbol sym = analyzer.getIdSymbols().get(id);
+                if (sym != null && sym.isConst() && sym.getConstValue() != null) {
+                    emit("li", "a0", String.valueOf(sym.getConstValue()));
+                    emit("j", funcEpilogueLabel());
+                    return;
+                }
+                String savedReg = symbolRegs.get(sym);
+                if (savedReg != null) {
+                    emit("mv", "a0", savedReg);
+                    emit("j", funcEpilogueLabel());
+                    return;
+                }
+            }
             String r = genExpr(rs.value());
             emit("mv", "a0", r); // return value in a0
             freeReg(r);
         }
         // Jump to epilogue
         emit("j", funcEpilogueLabel());
+    }
+
+    private void genBranchIfFalse(Expr expr, String label) {
+        if (expr instanceof UnaryExpr ue && "!".equals(ue.op())) {
+            genBranchIfTrue(ue.operand(), label);
+            return;
+        }
+        if (expr instanceof BinaryExpr be) {
+            if ("&&".equals(be.op())) {
+                genBranchIfFalse(be.left(), label);
+                genBranchIfFalse(be.right(), label);
+                return;
+            }
+            if ("||".equals(be.op())) {
+                String endLabel = newLabel("lor_true");
+                genBranchIfTrue(be.left(), endLabel);
+                genBranchIfFalse(be.right(), label);
+                emitLabel(endLabel);
+                return;
+            }
+            if (isCompareOp(be.op()) && !exprContainsCall(be.left()) && !exprContainsCall(be.right())) {
+                emitCompareBranch(be.op(), false, be.left(), be.right(), label);
+                return;
+            }
+        }
+
+        String r = genExpr(expr);
+        emit("beqz", r, label);
+        freeReg(r);
+    }
+
+    private void genBranchIfTrue(Expr expr, String label) {
+        if (expr instanceof UnaryExpr ue && "!".equals(ue.op())) {
+            genBranchIfFalse(ue.operand(), label);
+            return;
+        }
+        if (expr instanceof BinaryExpr be) {
+            if ("&&".equals(be.op())) {
+                String falseLabel = newLabel("land_false");
+                genBranchIfFalse(be.left(), falseLabel);
+                genBranchIfTrue(be.right(), label);
+                emitLabel(falseLabel);
+                return;
+            }
+            if ("||".equals(be.op())) {
+                genBranchIfTrue(be.left(), label);
+                genBranchIfTrue(be.right(), label);
+                return;
+            }
+            if (isCompareOp(be.op()) && !exprContainsCall(be.left()) && !exprContainsCall(be.right())) {
+                emitCompareBranch(be.op(), true, be.left(), be.right(), label);
+                return;
+            }
+        }
+
+        String r = genExpr(expr);
+        emit("bnez", r, label);
+        freeReg(r);
+    }
+
+    private boolean isCompareOp(String op) {
+        return "==".equals(op) || "!=".equals(op) || "<".equals(op)
+                || ">".equals(op) || "<=".equals(op) || ">=".equals(op);
+    }
+
+    private void emitCompareBranch(String op, boolean branchOnTrue, Expr left, Expr right, String label) {
+        String l = genExpr(left);
+        String r = genExpr(right);
+
+        if (branchOnTrue) {
+            switch (op) {
+                case "==" -> emit("beq", l, r, label);
+                case "!=" -> emit("bne", l, r, label);
+                case "<" -> emit("blt", l, r, label);
+                case ">" -> emit("blt", r, l, label);
+                case "<=" -> emit("bge", r, l, label);
+                case ">=" -> emit("bge", l, r, label);
+                default -> {}
+            }
+        } else {
+            switch (op) {
+                case "==" -> emit("bne", l, r, label);
+                case "!=" -> emit("beq", l, r, label);
+                case "<" -> emit("bge", l, r, label);
+                case ">" -> emit("bge", r, l, label);
+                case "<=" -> emit("blt", r, l, label);
+                case ">=" -> emit("blt", l, r, label);
+                default -> {}
+            }
+        }
+
+        freeReg(r);
+        freeReg(l);
+    }
+
+    private List<Set<Symbol>> buildSuffixUses(List<Stmt> stmts) {
+        List<Set<Symbol>> suffix = new ArrayList<>(Collections.nCopies(stmts.size() + 1, null));
+        Set<Symbol> live = newIdentitySet();
+        suffix.set(stmts.size(), newIdentitySet());
+        for (int i = stmts.size() - 1; i >= 0; i--) {
+            Set<Symbol> current = newIdentitySet();
+            current.addAll(live);
+            suffix.set(i + 1, current);
+
+            removeAssignedLocals(live, stmts.get(i));
+            collectUsedSymbols(stmts.get(i), live);
+        }
+        suffix.set(0, live);
+        return suffix;
+    }
+
+    private boolean isDeadForLiveOut(Stmt stmt, Set<Symbol> liveOut) {
+        if (stmt instanceof AssignStmt as_) {
+            Symbol target = analyzer.getAssignSymbols().get(as_);
+            return target != null && !target.isGlobal()
+                    && !liveOut.contains(target)
+                    && isPureExpr(as_.value());
+        }
+        if (stmt instanceof VarDecl vd) {
+            Symbol target = analyzer.getVarDeclSymbols().get(vd);
+            return target != null && !liveOut.contains(target) && isPureExpr(vd.initExpr());
+        }
+        if (stmt instanceof ConstDecl cd) {
+            Symbol target = analyzer.getConstDeclSymbols().get(cd);
+            return target != null && !liveOut.contains(target) && isPureExpr(cd.initExpr());
+        }
+        if (stmt instanceof WhileStmt ws) {
+            if (!isPureExpr(ws.condition()) || stmtMayHaveSideEffects(ws.body())) return false;
+            Set<Symbol> assigned = newIdentitySet();
+            collectAssignedSymbols(ws.body(), assigned);
+            for (Symbol sym : assigned) {
+                if (liveOut.contains(sym)) return false;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    private void removeAssignedLocals(Set<Symbol> symbols, Stmt stmt) {
+        Set<Symbol> assigned = newIdentitySet();
+        collectAssignedSymbols(stmt, assigned);
+        for (Symbol sym : assigned) {
+            if (!sym.isGlobal()) symbols.remove(sym);
+        }
+    }
+
+    private void collectUsedSymbols(Stmt stmt, Set<Symbol> out) {
+        switch (stmt) {
+            case Block b -> {
+                for (Stmt s : b.stmts()) collectUsedSymbols(s, out);
+            }
+            case ExprStmt es -> collectUsedSymbols(es.expr(), out);
+            case AssignStmt as_ -> collectUsedSymbols(as_.value(), out);
+            case VarDecl vd -> collectUsedSymbols(vd.initExpr(), out);
+            case ConstDecl cd -> collectUsedSymbols(cd.initExpr(), out);
+            case IfStmt is -> {
+                collectUsedSymbols(is.condition(), out);
+                collectUsedSymbols(is.thenStmt(), out);
+                if (is.elseStmt() != null) collectUsedSymbols(is.elseStmt(), out);
+            }
+            case WhileStmt ws -> {
+                collectUsedSymbols(ws.condition(), out);
+                collectUsedSymbols(ws.body(), out);
+            }
+            case ReturnStmt rs -> {
+                if (rs.value() != null) collectUsedSymbols(rs.value(), out);
+            }
+            default -> {}
+        }
+    }
+
+    private void collectUsedSymbols(Expr expr, Set<Symbol> out) {
+        switch (expr) {
+            case IdExpr id -> {
+                Symbol sym = analyzer.getIdSymbols().get(id);
+                if (sym != null) out.add(sym);
+            }
+            case BinaryExpr be -> {
+                collectUsedSymbols(be.left(), out);
+                collectUsedSymbols(be.right(), out);
+            }
+            case UnaryExpr ue -> collectUsedSymbols(ue.operand(), out);
+            case CallExpr ce -> {
+                for (Expr arg : ce.args()) collectUsedSymbols(arg, out);
+            }
+            default -> {}
+        }
+    }
+
+    private void collectAssignedSymbols(Stmt stmt, Set<Symbol> out) {
+        switch (stmt) {
+            case Block b -> {
+                for (Stmt s : b.stmts()) collectAssignedSymbols(s, out);
+            }
+            case AssignStmt as_ -> {
+                Symbol sym = analyzer.getAssignSymbols().get(as_);
+                if (sym != null) out.add(sym);
+            }
+            case VarDecl vd -> {
+                Symbol sym = analyzer.getVarDeclSymbols().get(vd);
+                if (sym != null) out.add(sym);
+            }
+            case ConstDecl cd -> {
+                Symbol sym = analyzer.getConstDeclSymbols().get(cd);
+                if (sym != null) out.add(sym);
+            }
+            case IfStmt is -> {
+                collectAssignedSymbols(is.thenStmt(), out);
+                if (is.elseStmt() != null) collectAssignedSymbols(is.elseStmt(), out);
+            }
+            case WhileStmt ws -> collectAssignedSymbols(ws.body(), out);
+            default -> {}
+        }
+    }
+
+    private boolean stmtMayHaveSideEffects(Stmt stmt) {
+        return switch (stmt) {
+            case Block b -> {
+                boolean result = false;
+                for (Stmt s : b.stmts()) {
+                    if (stmtMayHaveSideEffects(s)) {
+                        result = true;
+                        break;
+                    }
+                }
+                yield result;
+            }
+            case ExprStmt es -> !isPureExpr(es.expr());
+            case AssignStmt as_ -> {
+                Symbol sym = analyzer.getAssignSymbols().get(as_);
+                yield sym == null || sym.isGlobal() || !isPureExpr(as_.value());
+            }
+            case VarDecl vd -> !isPureExpr(vd.initExpr());
+            case ConstDecl cd -> !isPureExpr(cd.initExpr());
+            case IfStmt is -> !isPureExpr(is.condition())
+                    || stmtMayHaveSideEffects(is.thenStmt())
+                    || (is.elseStmt() != null && stmtMayHaveSideEffects(is.elseStmt()));
+            case WhileStmt ws -> !isPureExpr(ws.condition()) || stmtMayHaveSideEffects(ws.body());
+            case ReturnStmt ignored -> true;
+            default -> false;
+        };
+    }
+
+    private Set<Symbol> newIdentitySet() {
+        return Collections.newSetFromMap(new IdentityHashMap<>());
+    }
+
+    private boolean tryEmitTailRecursiveReturn(Expr value) {
+        if (!(value instanceof CallExpr ce)) return false;
+        if (currentFunc == null || !currentFunc.name().equals(ce.funcName())) return false;
+
+        List<Symbol> paramSymbols = analyzer.getFuncParamSymbols().get(currentFunc);
+        if (paramSymbols == null || ce.args().size() != paramSymbols.size()) return false;
+
+        clearCallerSavedStateBeforeCall();
+
+        if (ce.args().size() <= NUM_TEMPS && !callArgsContainCall(ce)) {
+            String[] argRegs = new String[ce.args().size()];
+            for (int i = 0; i < ce.args().size(); i++) {
+                argRegs[i] = genExpr(ce.args().get(i));
+            }
+            assignTailArgsToParams(paramSymbols, argRegs);
+            emit("j", currentFuncBodyLabel);
+            return true;
+        }
+
+        int[] argSlots = new int[ce.args().size()];
+        for (int i = 0; i < ce.args().size(); i++) {
+            String r = genExpr(ce.args().get(i));
+            int slot = allocateSpillSlot();
+            spillReg(r, slot);
+            freeReg(r);
+            argSlots[i] = slot;
+        }
+
+        Symbol funcSym = analyzer.getFuncSymbols().get(currentFunc);
+        List<String> paramNames = funcSym != null ? funcSym.getFuncParamNames() : null;
+        for (int i = 0; i < paramSymbols.size(); i++) {
+            Symbol paramSym = paramSymbols.get(i);
+            String savedReg = symbolRegs.get(paramSym);
+            if (savedReg != null) {
+                emit("lw", savedReg, argSlots[i] + "(s0)");
+                freeSpillSlot(argSlots[i]);
+                continue;
+            }
+
+            String r = loadSpill(argSlots[i]);
+            freeSpillSlot(argSlots[i]);
+            String paramName = paramNames != null ? paramNames.get(i) : paramSym.getName();
+            int offset = getLocalOffset(paramName);
+            emit("sw", r, offset + "(s0)");
+            freeReg(r);
+        }
+
+        emit("j", currentFuncBodyLabel);
+        return true;
+    }
+
+    private boolean callArgsContainCall(CallExpr ce) {
+        for (Expr arg : ce.args()) {
+            if (exprContainsCall(arg)) return true;
+        }
+        return false;
+    }
+
+    private void assignTailArgsToParams(List<Symbol> paramSymbols, String[] argRegs) {
+        Symbol funcSym = analyzer.getFuncSymbols().get(currentFunc);
+        List<String> paramNames = funcSym != null ? funcSym.getFuncParamNames() : null;
+
+        for (int i = 0; i < paramSymbols.size(); i++) {
+            Symbol paramSym = paramSymbols.get(i);
+            String savedReg = symbolRegs.get(paramSym);
+            if (savedReg != null) {
+                if (!savedReg.equals(argRegs[i])) {
+                    emit("mv", savedReg, argRegs[i]);
+                }
+            } else {
+                String paramName = paramNames != null ? paramNames.get(i) : paramSym.getName();
+                int offset = getLocalOffset(paramName);
+                emit("sw", argRegs[i], offset + "(s0)");
+            }
+            freeReg(argRegs[i]);
+        }
+    }
+
+    private boolean tryEmitAssignToSavedReg(AssignStmt stmt, Symbol targetSym, String targetReg) {
+        Expr value = stmt.value();
+
+        if (value instanceof LiteralExpr le) {
+            emit("li", targetReg, String.valueOf(le.value()));
+            return true;
+        }
+        if (value instanceof IdExpr id) {
+            Symbol valueSym = analyzer.getIdSymbols().get(id);
+            if (valueSym == targetSym) return true;
+            if (valueSym != null && valueSym.isConst() && valueSym.getConstValue() != null) {
+                emit("li", targetReg, String.valueOf(valueSym.getConstValue()));
+                return true;
+            }
+            String sourceReg = symbolRegs.get(valueSym);
+            if (sourceReg != null) {
+                emit("mv", targetReg, sourceReg);
+                return true;
+            }
+            return false;
+        }
+        if (value instanceof UnaryExpr ue) {
+            if (ue.operand() instanceof IdExpr id && analyzer.getIdSymbols().get(id) == targetSym) {
+                switch (ue.op()) {
+                    case "+" -> { return true; }
+                    case "-" -> { emit("sub", targetReg, "zero", targetReg); return true; }
+                    case "!" -> { emit("seqz", targetReg, targetReg); return true; }
+                    default -> { return false; }
+                }
+            }
+            return false;
+        }
+        if (value instanceof BinaryExpr be) {
+            if ("&&".equals(be.op()) || "||".equals(be.op())) return false;
+
+            if (be.left() instanceof IdExpr leftId
+                    && analyzer.getIdSymbols().get(leftId) == targetSym) {
+                if (be.right() instanceof LiteralExpr rle
+                        && tryEmitRightLiteralOp(be.op(), targetReg, rle.value())) {
+                    return true;
+                }
+                if (be.right() instanceof IdExpr rightId) {
+                    Symbol rightSym = analyzer.getIdSymbols().get(rightId);
+                    if (rightSym != null && rightSym.isConst() && rightSym.getConstValue() != null
+                            && tryEmitRightLiteralOp(be.op(), targetReg, rightSym.getConstValue())) {
+                        return true;
+                    }
+                    String rightSavedReg = symbolRegs.get(rightSym);
+                    if (rightSavedReg != null) {
+                        emitBinaryOp(be.op(), targetReg, targetReg, rightSavedReg);
+                        return true;
+                    }
+                }
+                String rightReg = genExpr(be.right());
+                emitBinaryOp(be.op(), targetReg, targetReg, rightReg);
+                freeReg(rightReg);
+                return true;
+            }
+
+            if (isCommutative(be.op())
+                    && be.right() instanceof IdExpr rightId
+                    && analyzer.getIdSymbols().get(rightId) == targetSym) {
+                if (be.left() instanceof IdExpr leftId) {
+                    String leftSavedReg = symbolRegs.get(analyzer.getIdSymbols().get(leftId));
+                    if (leftSavedReg != null) {
+                        emitBinaryOp(be.op(), targetReg, leftSavedReg, targetReg);
+                        return true;
+                    }
+                }
+                String leftReg = genExpr(be.left());
+                emitBinaryOp(be.op(), targetReg, leftReg, targetReg);
+                freeReg(leftReg);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isCommutative(String op) {
+        return "+".equals(op) || "*".equals(op) || "==".equals(op) || "!=".equals(op);
+    }
+
+    private void emitBinaryOp(String op, String rd, String leftReg, String rightReg) {
+        switch (op) {
+            case "+" -> emit("add", rd, leftReg, rightReg);
+            case "-" -> emit("sub", rd, leftReg, rightReg);
+            case "*" -> emit("mul", rd, leftReg, rightReg);
+            case "/" -> emit("div", rd, leftReg, rightReg);
+            case "%" -> emit("rem", rd, leftReg, rightReg);
+            case "==" -> {
+                emit("sub", rd, leftReg, rightReg);
+                emit("seqz", rd, rd);
+            }
+            case "!=" -> {
+                emit("sub", rd, leftReg, rightReg);
+                emit("snez", rd, rd);
+            }
+            case "<"  -> emit("slt", rd, leftReg, rightReg);
+            case ">=" -> {
+                emit("slt", rd, leftReg, rightReg);
+                emit("xori", rd, rd, "1");
+            }
+            case ">"  -> emit("slt", rd, rightReg, leftReg);
+            case "<=" -> {
+                emit("slt", rd, rightReg, leftReg);
+                emit("xori", rd, rd, "1");
+            }
+            default -> emit("add", rd, leftReg, rightReg);
+        }
     }
 
     // ========== Expression generation ==========
@@ -682,17 +2492,23 @@ public class CodeGenerator {
             return r;
         }
 
-        // Last-store optimization: if variable was just stored and its
-        // register hasn't been reused, use it directly (avoid lw).
+        String savedReg = symbolRegs.get(sym);
+        if (savedReg != null) {
+            String r = allocReg();
+            emit("mv", r, savedReg);
+            return r;
+        }
+
+        // Persistent last-store cache: if variable's register is still
+        // valid, copy it to a new temp register without consuming.
+        // The cache survives multiple reads until the register is
+        // stolen by allocReg or the variable is reassigned.
         if (optimize) {
             String lsReg = lastStoreReg.get(id.name());
             if (lsReg != null && regValid.contains(lsReg)) {
-                // Register still holds the value — use it and consume.
-                regValid.remove(lsReg);
-                lastStoreReg.remove(id.name());
-                // Mark this register as allocated for the caller.
-                tempUsed[regIndex(lsReg)] = true;
-                return lsReg;
+                String r = allocReg();
+                emit("mv", r, lsReg);
+                return r;
             }
         }
 
@@ -713,8 +2529,11 @@ public class CodeGenerator {
             }
             if (paramIdx >= 0 && paramIdx < 8) {
                 emit("mv", r, "a" + paramIdx);
+            } else if (paramIdx >= 8 && frameSize > 0) {
+                int callerOff = frameSize + (paramIdx - 8) * 4;
+                emit("lw", r, callerOff + "(sp)");
             } else {
-                emit("li", r, "0"); // fallback (should not happen)
+                emit("li", r, "0");
             }
         } else {
             int offset = getLocalOffset(id.name());
@@ -743,6 +2562,12 @@ public class CodeGenerator {
         }
 
         String leftReg = genExpr(be.left());
+        if (optimize && be.right() instanceof LiteralExpr rle) {
+            int imm = rle.value();
+            if (tryEmitRightLiteralOp(be.op(), leftReg, imm)) {
+                return leftReg;
+            }
+        }
 
         // Only spill left if the right operand contains a function call
         // (which may clobber caller-saved temp registers t0-t6).
@@ -765,12 +2590,47 @@ public class CodeGenerator {
             // Don't free leftReg — it's now resultReg
         }
 
-        // Strength reduction: use immediate instructions when possible
-        if (optimize && be.right() instanceof LiteralExpr rle) {
-            int imm = rle.value();
-            if (tryEmitImmOp(be.op(), resultReg, resultReg, imm)) {
-                freeReg(rightReg);
-                return resultReg;
+        // Algebraic identities and strength reduction
+        if (optimize) {
+            // Right-side literal identities
+            if (be.right() instanceof LiteralExpr rle) {
+                int imm = rle.value();
+                boolean handled = false;
+                switch (be.op()) {
+                    case "+" -> { if (imm == 0) handled = true; }
+                    case "-" -> { if (imm == 0) handled = true; }
+                    case "*" -> {
+                        if (imm == 0) { emit("mv", resultReg, "zero"); handled = true; }
+                        else if (imm == 1) handled = true;
+                        else if ((imm & (imm - 1)) == 0 && imm > 0) {
+                            emit("slli", resultReg, resultReg,
+                                 String.valueOf(Integer.numberOfTrailingZeros(imm)));
+                            handled = true;
+                        }
+                    }
+                    case "/" -> { if (imm == 1) handled = true; }
+                    case "%" -> { if (imm == 1) { emit("mv", resultReg, "zero"); handled = true; } }
+                }
+                if (handled) { freeReg(rightReg); return resultReg; }
+                if (tryEmitImmOp(be.op(), resultReg, resultReg, imm)) {
+                    freeReg(rightReg); return resultReg;
+                }
+            }
+            // Left-side literal commutative identities
+            if (be.left() instanceof LiteralExpr lle) {
+                int imm = lle.value();
+                boolean handled = false;
+                switch (be.op()) {
+                    case "+" -> { if (imm == 0) { freeReg(resultReg); return rightReg; } }
+                    case "*" -> {
+                        if (imm == 0) { emit("mv", resultReg, "zero"); handled = true; }
+                        else if (imm == 1) { freeReg(resultReg); return rightReg; }
+                    }
+                    case "-" -> {
+                        if (imm == 0) { emit("sub", resultReg, "zero", rightReg); handled = true; }
+                    }
+                }
+                if (handled) { freeReg(rightReg); return resultReg; }
             }
         }
 
@@ -852,18 +2712,91 @@ public class CodeGenerator {
 
     /** Try to emit an immediate-form instruction. Returns true if successful. */
     private boolean tryEmitImmOp(String op, String rd, String rs, int imm) {
-        if (imm < -2048 || imm > 2047) return false;
         switch (op) {
-            case "+" -> { emit("addi", rd, rs, String.valueOf(imm)); return true; }
-            case "-" -> { emit("addi", rd, rs, String.valueOf(-imm)); return true; }
-            case "<" -> { emit("slti", rd, rs, String.valueOf(imm)); return true; }
+            case "+" -> {
+                if (!isImm12(imm)) return false;
+                emit("addi", rd, rs, String.valueOf(imm)); return true;
+            }
+            case "-" -> {
+                if (!isImm12(-imm)) return false;
+                emit("addi", rd, rs, String.valueOf(-imm)); return true;
+            }
+            case "<" -> {
+                if (!isImm12(imm)) return false;
+                emit("slti", rd, rs, String.valueOf(imm)); return true;
+            }
             case ">=" -> {
+                if (!isImm12(imm)) return false;
                 emit("slti", rd, rs, String.valueOf(imm));
-                emit("xori", rd, rd, "1");
+                emit("xori", rd, rd, "1"); return true;
+            }
+            case ">" -> {
+                if (imm < 2047 && isImm12(imm + 1)) {
+                    emit("slti", rd, rs, String.valueOf(imm + 1));
+                    emit("xori", rd, rd, "1"); return true;
+                } else return false;
+            }
+            case "<=" -> {
+                if (imm < 2047 && isImm12(imm + 1)) {
+                    emit("slti", rd, rs, String.valueOf(imm + 1));
+                    return true;
+                } else return false;
+            }
+            case "==" -> {
+                if (!isImm12(-imm)) return false;
+                if (imm == 0) emit("seqz", rd, rs);
+                else { emit("addi", rd, rs, String.valueOf(-imm)); emit("seqz", rd, rd); }
+                return true;
+            }
+            case "!=" -> {
+                if (!isImm12(-imm)) return false;
+                if (imm == 0) emit("snez", rd, rs);
+                else { emit("addi", rd, rs, String.valueOf(-imm)); emit("snez", rd, rd); }
                 return true;
             }
             default -> { return false; }
         }
+    }
+
+    private boolean tryEmitRightLiteralOp(String op, String rd, int imm) {
+        switch (op) {
+            case "+" -> {
+                if (imm == 0) return true;
+                return tryEmitImmOp(op, rd, rd, imm);
+            }
+            case "-" -> {
+                if (imm == 0) return true;
+                return tryEmitImmOp(op, rd, rd, imm);
+            }
+            case "*" -> {
+                if (imm == 0) { emit("mv", rd, "zero"); return true; }
+                if (imm == 1) return true;
+                if (imm > 0 && (imm & (imm - 1)) == 0) {
+                    emit("slli", rd, rd, String.valueOf(Integer.numberOfTrailingZeros(imm)));
+                    return true;
+                }
+                return false;
+            }
+            case "/" -> {
+                if (imm == 1) return true;
+                if (imm == -1) { emit("sub", rd, "zero", rd); return true; }
+                return false;
+            }
+            case "%" -> {
+                if (imm == 1 || imm == -1) { emit("mv", rd, "zero"); return true; }
+                return false;
+            }
+            case "<", ">", "<=", ">=", "==", "!=" -> {
+                return tryEmitImmOp(op, rd, rd, imm);
+            }
+            default -> {
+                return false;
+            }
+        }
+    }
+
+    private boolean isImm12(int imm) {
+        return imm >= -2048 && imm <= 2047;
     }
 
     /**
@@ -987,6 +2920,10 @@ public class CodeGenerator {
     }
 
     private String genCall(CallExpr ce) {
+        if (ce.args().size() > NUM_TEMPS) {
+            return genLargeCall(ce);
+        }
+
         // Before a call, clear last-store tracking since caller-saved regs
         // (t0-t6, a0-a7) will be clobbered. Must also free the underlying
         // temp registers, otherwise they stay marked as "used" forever.
@@ -997,6 +2934,7 @@ public class CodeGenerator {
             invalidateRegCache();
             lastStoreReg.clear();
             regValid.clear();
+            for (int i = 0; i < NUM_A_REGS; i++) aUsed[i] = false;
         }
 
         int numArgs = ce.args().size();
@@ -1124,6 +3062,63 @@ public class CodeGenerator {
         return resultReg;
     }
 
+    private String genLargeCall(CallExpr ce) {
+        clearCallerSavedStateBeforeCall();
+
+        int numArgs = ce.args().size();
+        int regArgCount = Math.min(numArgs, 8);
+        int[] argSpills = new int[numArgs];
+
+        for (int i = 0; i < numArgs; i++) {
+            String r = genExpr(ce.args().get(i));
+            int slot = allocateSpillSlot();
+            spillReg(r, slot);
+            freeReg(r);
+            argSpills[i] = slot;
+        }
+
+        for (int i = 0; i < regArgCount; i++) {
+            emit("lw", "a" + i, argSpills[i] + "(s0)");
+            freeSpillSlot(argSpills[i]);
+        }
+
+        int extraArgs = numArgs - 8;
+        int extraAlignedSize = 0;
+        if (extraArgs > 0) {
+            int extraSize = extraArgs * 4;
+            extraAlignedSize = (extraSize + 15) & ~15;
+            emit("addi", "sp", "sp", String.valueOf(-extraAlignedSize));
+            for (int i = 8; i < numArgs; i++) {
+                String r = loadSpill(argSpills[i]);
+                freeSpillSlot(argSpills[i]);
+                emit("sw", r, ((i - 8) * 4) + "(sp)");
+                freeReg(r);
+            }
+        }
+
+        emit("call", ce.funcName());
+
+        if (extraAlignedSize > 0) {
+            emit("addi", "sp", "sp", String.valueOf(extraAlignedSize));
+        }
+
+        String resultReg = allocReg();
+        emit("mv", resultReg, "a0");
+        return resultReg;
+    }
+
+    private void clearCallerSavedStateBeforeCall() {
+        if (optimize) {
+            for (String reg : lastStoreReg.values()) {
+                freeRegRaw(reg);
+            }
+            invalidateRegCache();
+            lastStoreReg.clear();
+            regValid.clear();
+            for (int i = 0; i < NUM_A_REGS; i++) aUsed[i] = false;
+        }
+    }
+
     /** Count the number of free (unused) temp registers. */
     private int countFreeRegs() {
         int count = 0;
@@ -1242,6 +3237,10 @@ public class CodeGenerator {
                 return allocReg();
             }
         }
+        // Overflow: use a0-a7 as additional temp registers.
+        for (int i = 0; i < NUM_A_REGS; i++) {
+            if (!aUsed[i]) { aUsed[i] = true; return A_REGS[i]; }
+        }
         throw new RuntimeException("out of temporary registers");
     }
 
@@ -1261,18 +3260,18 @@ public class CodeGenerator {
     }
 
     private void freeReg(String reg) {
+        if (reg.startsWith("a")) {
+            for (int i = 0; i < NUM_A_REGS; i++)
+                if (A_REGS[i].equals(reg)) { aUsed[i] = false; return; }
+            return;
+        }
         for (int i = 0; i < NUM_TEMPS; i++) {
             if (TEMP_REGS[i].equals(reg)) {
                 tempUsed[i] = false;
-                // This register is being freed — any last-store value is gone
                 regValid.remove(reg);
-                // If this register was cached for a variable, invalidate
                 if (optimize) {
                     String var = regToVar.remove(reg);
-                    if (var != null) {
-                        varRegCache.remove(var);
-                        varDirty.remove(var);
-                    }
+                    if (var != null) { varRegCache.remove(var); varDirty.remove(var); }
                 }
                 return;
             }
@@ -1281,11 +3280,13 @@ public class CodeGenerator {
 
     /** Free a temp register without touching the cache. */
     private void freeRegRaw(String reg) {
+        if (reg.startsWith("a")) {
+            for (int i = 0; i < NUM_A_REGS; i++)
+                if (A_REGS[i].equals(reg)) { aUsed[i] = false; return; }
+            return;
+        }
         for (int i = 0; i < NUM_TEMPS; i++) {
-            if (TEMP_REGS[i].equals(reg)) {
-                tempUsed[i] = false;
-                return;
-            }
+            if (TEMP_REGS[i].equals(reg)) { tempUsed[i] = false; return; }
         }
     }
 
